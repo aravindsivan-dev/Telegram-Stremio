@@ -31,6 +31,7 @@ from Backend.helper.custom_dl import ByteStreamer, _speed_test_single_client, ru
 from Backend.helper.encrypt import decode_string, encode_string
 from Backend.helper.health import run_health_checks
 from Backend.helper.manual_add import resolve_telegram_message, retag_media, stamp_caption_by_ref
+from Backend.helper import own_bots
 from Backend.helper.pyro import resolve_video_thumb_url
 from Backend.helper.requests_manager import (
     delete_request,
@@ -406,6 +407,13 @@ async def backfill_subscriber_names_api() -> dict:
 async def grant_lifetime_api() -> dict:
     count = await db.grant_lifetime_to_unlinked()
     return {"status": "success", "updated": count, "message": f"{count} token(s) marked as lifetime."}
+
+async def update_token_cf_api(token: str, payload: dict):
+    try:
+        await own_bots.set_worker(token, payload.get("cf_url"), payload.get("cf_secret"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"message": "Cloudflare proxy saved"}
 
 async def update_token_limits_api(token: str, payload: dict):
     try:
@@ -873,6 +881,9 @@ async def get_all_tokens_api() -> dict:
                     f"{SettingsManager.current().base_url}/stremio/{token_str}/manifest.json"
                     if token_str else None
                 ),
+                "own_bots": own_bots.public(token_doc["own_bots"]) if token_doc.get("own_bots") else None,
+                "cf_url": (token_doc.get("cf") or {}).get("url", ""),
+                "cf_secret": (token_doc.get("cf") or {}).get("secret", ""),
             }
 
         seen_user_ids = set()
@@ -1802,7 +1813,7 @@ async def update_settings_api(payload: dict) -> dict:
         if key in payload:
             payload[key] = bool(payload[key])
 
-    list_str_keys = {"auth_channels", "multi_tokens", "extra_databases", "global_search_channels", "anime_channels", "manual_channels"}
+    list_str_keys = {"auth_channels", "multi_tokens", "helper_tokens", "extra_databases", "global_search_channels", "anime_channels", "manual_channels"}
     for key in list_str_keys:
         if key in payload:
             if not isinstance(payload[key], list):
