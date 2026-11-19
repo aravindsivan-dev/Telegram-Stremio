@@ -196,6 +196,8 @@ async def _sweep() -> None:
                 break
             except Exception as e:
                 LOGGER.warning(f"[OWN BOTS] Could not delete copies in {channel}: {e}")
+        else:
+            continue
         await _copies().delete_many({"_id": {"$in": [d["_id"] for d in docs]}})
         for d in docs:
             _known.pop(d["_id"], None)
@@ -289,13 +291,20 @@ async def verify(token_data: dict, channel, keep: list, add: list) -> dict:
             check("Test message", False, _reason(e))
         finally:
             if probe:
-                await helpers[0].delete_messages(channel, probe.id)
+                try:
+                    await helpers[0].delete_messages(channel, probe.id)
+                except Exception as e:
+                    check("Remove test message", False, _reason(e))
 
     ok = all(c["ok"] for c in checks)
     own = token_data.get("own_bots")
     if ok:
         own = {"channel": channel, "bots": bots, "verified_at": datetime.utcnow()}
-        await _tokens().update_one({"token": token_data["token"]}, {"$set": {"own_bots": own}})
+        try:
+            await _tokens().update_one({"token": token_data["token"]}, {"$set": {"own_bots": own}})
+        except BaseException:
+            await _stop(pool)
+            raise
         await stop_pool(token_data["token"])
         _pools[token_data["token"]] = pool
         _sync(token_data)
