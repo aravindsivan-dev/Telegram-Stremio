@@ -24,7 +24,7 @@ from Backend.helper.encrypt import decode_string, encode_string
 from Backend.helper.pyro import get_thumb_download_target
 from Backend.helper.settings_manager import SettingsManager
 from Backend.helper.utils import track_usage
-from Backend.helper.virtual_dl import ebml_video_mime, resolve_virtual_parts, virtual_stream_generator
+from Backend.helper.virtual_dl import resolve_virtual_parts, virtual_stream_generator
 from Backend.helper.zip_stream import resolve_zip_entry
 from Backend.logger import LOGGER
 import Backend.pyrofork.bot as botmod
@@ -44,7 +44,6 @@ _pool: ContextVar = ContextVar("pool", default=None)
 
 _title_cache = BoundedDict(2000)
 _TITLE_CACHE_TTL = 300
-_split_mime_cache = BoundedDict(512)
 
 
 #----- Recursively convert non-JSON-native containers to serializable forms
@@ -180,24 +179,6 @@ def _resolve_filename_mime(file_id):
     if "." not in file_name and "/" in mime_type:
         file_name = f"{file_name}.{mime_type.split('/')[1]}"
     return file_name, mime_type
-
-
-async def _resolve_split_filename_mime(file_id, streamer):
-    file_name, mime_type = _resolve_filename_mime(file_id)
-    if mime_type != "application/zip":
-        return file_name, mime_type
-
-    # Raw split videos can be uploaded with a ZIP MIME label. Use the
-    # Telegram document ID for the cache and use its bytes to verify the type.
-    if file_id.media_id not in _split_mime_cache:
-        try:
-            prefix = await asyncio.wait_for(streamer.read_file_prefix(file_id), timeout=3)
-        except Exception:
-            return file_name, mime_type
-        if not prefix:
-            return file_name, mime_type
-        _split_mime_cache[file_id.media_id] = ebml_video_mime(prefix) or mime_type
-    return file_name, _split_mime_cache[file_id.media_id]
 
 
 def _content_disposition(file_name, disposition="inline"):
@@ -380,7 +361,7 @@ async def media_streamer(request: Request, chat_id: int, msg_id: int, token: str
     offset = start - (start % chunk_size)
     first_part_cut = start - offset
     last_part_cut = (end % chunk_size) + 1
-    part_count = (end - offset) // chunk_size + 1
+    part_count = math.ceil(end / chunk_size) - math.floor(offset / chunk_size)
     stream_id = secrets.token_hex(8)
     decoded_name = unquote(request.path_params.get("name", ""))
     final_title = await _lookup_title(stream_id_hash, decoded_name)
@@ -453,7 +434,7 @@ async def virtual_media_streamer(request: Request, parts_payload: list, token: s
     stream_id = secrets.token_hex(8)
     decoded_name = unquote(request.path_params.get("name", ""))
     final_title = await _lookup_title(stream_id_hash, decoded_name)
-    file_name, mime_type = await _resolve_split_filename_mime(parts[0]["file_id"], streamer)
+    file_name, mime_type = _resolve_filename_mime(parts[0]["file_id"])
 
     meta = {
         "request_path": str(request.url.path),
@@ -516,7 +497,7 @@ async def global_media_streamer(request: Request, chat_id: int, msg_id: int, tok
     offset = start - (start % chunk_size)
     first_part_cut = start - offset
     last_part_cut = (end % chunk_size) + 1
-    part_count = (end - offset) // chunk_size + 1
+    part_count = math.ceil(end / chunk_size) - math.floor(offset / chunk_size)
     stream_id = secrets.token_hex(8)
 
     file_name, mime_type = _resolve_filename_mime(file_id)
@@ -573,7 +554,7 @@ async def global_virtual_media_streamer(request: Request, parts_payload: list, t
     stream_id = secrets.token_hex(8)
     decoded_name = unquote(request.path_params.get("name", ""))
     final_title = await _lookup_title(stream_id_hash, decoded_name)
-    file_name, mime_type = await _resolve_split_filename_mime(parts[0]["file_id"], streamer)
+    file_name, mime_type = _resolve_filename_mime(parts[0]["file_id"])
 
     meta = {
         "request_path": str(request.url.path),

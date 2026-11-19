@@ -124,13 +124,6 @@ class ByteStreamer:
             self._file_id_cache[cache_key] = file_id
         return self._file_id_cache[cache_key]
 
-    async def read_file_prefix(self, file_id: FileId) -> bytes:
-        """Read a single aligned Telegram block without starting a playback stream."""
-        session = await self._get_media_session(file_id)
-        location = await self._get_location(file_id)
-        result = await session.send(raw.functions.upload.GetFile(location=location, offset=0, limit=4096))
-        return getattr(result, "bytes", b"")
-
     #----- Build a prefetching, range-aware streaming generator for a file
     async def prefetch_stream(
         self,

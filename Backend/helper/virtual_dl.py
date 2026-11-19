@@ -1,3 +1,4 @@
+import math
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import Request
@@ -66,7 +67,7 @@ async def virtual_stream_generator(
         offset = local_start - (local_start % chunk_size)
         first_part_cut = local_start - offset
         last_part_cut = (local_end % chunk_size) + 1
-        part_count = (local_end - offset) // chunk_size + 1
+        part_count = math.ceil(local_end / chunk_size) - math.floor(offset / chunk_size)
 
         body_gen = await streamer.prefetch_stream(
             file_id=part["file_id"],
@@ -100,41 +101,3 @@ async def virtual_stream_generator(
         pos = part_end + 1
         if pos > end:
             break
-
-
-def ebml_video_mime(prefix: bytes) -> Optional[str]:
-    """Identify Matroska or WebM by the DocType in a complete EBML header."""
-    if not prefix.startswith(b"\x1a\x45\xdf\xa3"):
-        return None
-
-    def vint(offset: int, max_width: int, strip_marker: bool):
-        if offset >= len(prefix) or prefix[offset] == 0:
-            raise ValueError("Missing EBML variable-length integer")
-        width = 9 - prefix[offset].bit_length()
-        if width > max_width or offset + width > len(prefix):
-            raise ValueError("Invalid EBML variable-length integer")
-        value = int.from_bytes(prefix[offset:offset + width], "big")
-        if strip_marker:
-            marker = 1 << (7 * width)
-            value -= marker
-            if value == marker - 1:
-                raise ValueError("Unknown EBML element size")
-        return value, offset + width
-
-    try:
-        size, offset = vint(4, 8, True)
-        header_end = offset + size
-        if header_end > len(prefix):
-            return None
-        while offset < header_end:
-            element, offset = vint(offset, 4, False)
-            size, offset = vint(offset, 8, True)
-            end = offset + size
-            if end > header_end:
-                return None
-            if element == 0x4282:
-                return {b"matroska": "video/x-matroska", b"webm": "video/webm"}.get(prefix[offset:end])
-            offset = end
-    except ValueError:
-        return None
-    return None
