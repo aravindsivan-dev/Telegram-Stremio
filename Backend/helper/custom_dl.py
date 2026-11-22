@@ -277,25 +277,40 @@ class ByteStreamer:
             scheduled_tasks = deque()
             next_to_schedule = 0
             max_parallel = max(1, parallelism)
+            # A small reorder buffer lets a free slot fetch past a slow chunk.
+            window_size = 2 * max_parallel if max_parallel > 1 else 1
 
             def fill_window():
                 nonlocal next_to_schedule
-                while len(scheduled_tasks) < max_parallel and next_to_schedule < part_count:
+                in_flight = {task for task in scheduled_tasks if not task.done()}
+                while (
+                    len(in_flight) < max_parallel
+                    and len(scheduled_tasks) < window_size
+                    and next_to_schedule < part_count
+                ):
                     off = offset + next_to_schedule * chunk_size
                     task = asyncio.create_task(fetch_chunk_with_retries(next_to_schedule, off))
                     scheduled_tasks.append(task)
+                    in_flight.add(task)
                     next_to_schedule += 1
+                return in_flight
 
             try:
-                fill_window()
+                in_flight = fill_window()
                 while scheduled_tasks and not stop_event.is_set():
-                    # Keep completed chunks in the same bounded window until their turn.
-                    seq_idx, chunk_bytes = await scheduled_tasks[0]
+                    next_task = scheduled_tasks[0]
+                    if not next_task.done() and len(scheduled_tasks) < window_size and next_to_schedule < part_count:
+                        await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+                        if not next_task.done():
+                            in_flight = fill_window()
+                            continue
+
+                    seq_idx, chunk_bytes = await next_task
                     scheduled_tasks.popleft()
                     if chunk_bytes is None:
                         stream_entry["status"] = "error"
                         break
-                    fill_window()
+                    in_flight = fill_window()
                     await q.put((offset + seq_idx * chunk_size, chunk_bytes))
             except Exception as e:
                 stream_entry["status"] = "error"
