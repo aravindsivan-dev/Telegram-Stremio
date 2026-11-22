@@ -29,6 +29,10 @@ _RECENT_CHUNKS = BoundedDict(64)
 _RECENT_CHUNK_TTL = 45
 
 
+def _media_identity(file_id: FileId) -> tuple[int, int, int]:
+    return file_id.dc_id, file_id.media_id, file_id.file_size
+
+
 async def _cleanup_stale_streams():
     while True:
         try:
@@ -175,41 +179,42 @@ class ByteStreamer:
         q: asyncio.Queue = asyncio.Queue(maxsize=queue_maxsize)
         stop_event = asyncio.Event()
 
+        media_identity = _media_identity(file_id)
         media_session = await self._get_media_session(file_id)
         location_box: List[object] = [await self._get_location(file_id)]
-        async def _make_refresh_fn(loc_b, streamer_ref, file_id_ref):
-            async def _refresh() -> bool:
-                if not chat_id or not message_id:
-                    return False
+
+        async def refresh_location(loc_box, streamer) -> bool:
+            if chat_id is not None and message_id is not None:
                 try:
                     cache_key = (int(chat_id), int(message_id))
-                    streamer_ref._file_id_cache.pop(cache_key, None)
-                    fresh = await get_file_ids(streamer_ref.client, chat_id, message_id)
+                    streamer._file_id_cache.pop(cache_key, None)
+                    fresh = await get_file_ids(streamer.client, chat_id, message_id)
                     if fresh:
-                        streamer_ref._file_id_cache[cache_key] = fresh
-                        loc_b[0] = await ByteStreamer._get_location(fresh)
-                        return True
+                        streamer._file_id_cache[cache_key] = fresh
+                        if _media_identity(fresh) != media_identity:
+                            LOGGER.warning("Telegram media changed during stream %s", stream_id)
+                            return False
+                        loc_box[0] = await ByteStreamer._get_location(fresh)
                 except Exception as exc:
                     LOGGER.warning("Location refresh failed for chat=%s msg_id=%s: %s", chat_id, message_id, exc)
-                return False
-            return _refresh
+            return True
 
-        primary_refresh = await _make_refresh_fn(location_box, self, file_id)
-        session_pool = [(client_index, media_session, location_box, primary_refresh)]
+        session_pool = [(client_index, media_session, location_box, self)]
 
         if extra_clients:
             for ec_idx, ec_streamer, ec_file_id in extra_clients:
                 try:
+                    if _media_identity(ec_file_id) != media_identity:
+                        continue
                     ec_session = await ec_streamer._get_media_session(ec_file_id)
                     ec_loc_box = [await ByteStreamer._get_location(ec_file_id)]
-                    ec_refresh = await _make_refresh_fn(ec_loc_box, ec_streamer, ec_file_id)
-                    session_pool.append((ec_idx, ec_session, ec_loc_box, ec_refresh))
+                    session_pool.append((ec_idx, ec_session, ec_loc_box, ec_streamer))
                 except Exception as e:
                     LOGGER.warning("Skipping extra client %s (session setup failed): %s", ec_idx, e)
 
         cache_identity = None
         if rewind_scope and chat_id is not None and message_id is not None and chunk_size == self.CHUNK_SIZE:
-            cache_identity = (rewind_scope, chat_id, message_id, file_id.dc_id, file_id.media_id, file_id.file_size)
+            cache_identity = (rewind_scope, chat_id, message_id, *media_identity)
 
         async def fetch_chunk_with_retries(seq_idx: int, off: int) -> Tuple[int, Optional[bytes]]:
             cache_key = (*cache_identity, off) if cache_identity is not None else None
@@ -223,7 +228,7 @@ class ByteStreamer:
             flood_tries = 0
             expected = min(chunk_size, file_id.file_size - off)
             while tries < 3 and flood_tries < 5 and not stop_event.is_set():
-                c_idx, c_session, c_loc_box, c_refresh = session_pool[(seq_idx + tries) % len(session_pool)]
+                c_idx, c_session, c_loc_box, c_streamer = session_pool[(seq_idx + tries) % len(session_pool)]
                 try:
                     location = c_loc_box[0]
                     r = await asyncio.wait_for(
@@ -258,7 +263,8 @@ class ByteStreamer:
                     err_str = str(e)
 
                     if "FILE_REFERENCE" in err_str or "file_reference" in err_str.lower():
-                        await c_refresh()
+                        if not await refresh_location(c_loc_box, c_streamer):
+                            return seq_idx, None
 
                     flood_m = re.search(r'wait of (\d+) second', err_str, re.IGNORECASE)
                     if flood_m:
