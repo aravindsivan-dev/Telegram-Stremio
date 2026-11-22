@@ -362,10 +362,14 @@ async def media_streamer(request: Request, chat_id: int, msg_id: int, token: str
     first_part_cut = start - offset
     last_part_cut = (end % chunk_size) + 1
     part_count = (end - offset) // chunk_size + 1
+    file_name, mime_type = _resolve_filename_mime(file_id)
+    headers, status = _build_stream_headers(mime_type, file_name, req_length, range_header, start, end, file_size)
+    if request.method == "HEAD":
+        return PlainResponse(status_code=status, headers=headers)
+
     stream_id = secrets.token_hex(8)
     decoded_name = unquote(request.path_params.get("name", ""))
     final_title = await _lookup_title(stream_id_hash, decoded_name)
-    file_name, mime_type = _resolve_filename_mime(file_id)
     meta = {
         "request_path": str(request.url.path),
         "client_host": request.client.host if request.client else None,
@@ -414,11 +418,6 @@ async def media_streamer(request: Request, chat_id: int, msg_id: int, token: str
     )
 
     asyncio.create_task(track_usage(stream_id, token, token_data))
-
-    headers, status = _build_stream_headers(mime_type, file_name, req_length, range_header, start, end, file_size)
-
-    if request.method == "HEAD":
-        return PlainResponse(status_code=status, headers=headers)
     return StreamingResponse(body_gen, headers=headers, status_code=status, media_type=mime_type)
 
 
@@ -432,10 +431,14 @@ async def virtual_media_streamer(request: Request, parts_payload: list, token: s
     start, end = parse_range_header(range_header, file_size)
     req_length = end - start + 1
     chunk_size = 1024 * 1024
+    file_name, mime_type = _resolve_filename_mime(parts[0]["file_id"])
+    common_headers, status = _build_stream_headers(mime_type, file_name, req_length, range_header, start, end, file_size)
+    if request.method == "HEAD":
+        return PlainResponse(status_code=status, headers=common_headers)
+
     stream_id = secrets.token_hex(8)
     decoded_name = unquote(request.path_params.get("name", ""))
     final_title = await _lookup_title(stream_id_hash, decoded_name)
-    file_name, mime_type = _resolve_filename_mime(parts[0]["file_id"])
 
     meta = {
         "request_path": str(request.url.path),
@@ -450,11 +453,6 @@ async def virtual_media_streamer(request: Request, parts_payload: list, token: s
     parallelism, prefetch_count = _prefetch_for(index)
 
     asyncio.create_task(track_usage(stream_id, token, token_data))
-
-    common_headers, status = _build_stream_headers(mime_type, file_name, req_length, range_header, start, end, file_size)
-
-    if request.method == "HEAD":
-        return PlainResponse(status_code=status, headers=common_headers)
 
     body_gen = virtual_stream_generator(
         parts=parts, start=start, end=end, chunk_size=chunk_size,
