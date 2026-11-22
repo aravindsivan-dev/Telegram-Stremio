@@ -151,7 +151,7 @@ class ByteStreamer:
             stream_id = secrets.token_hex(8)
 
         now = time.time()
-        registry_entry = {
+        stream_entry = {
             "stream_id": stream_id,
             "msg_id": getattr(file_id, "local_id", None) or None,
             "chat_id": getattr(file_id, "chat_id", None),
@@ -170,10 +170,6 @@ class ByteStreamer:
             "meta": meta or {},
             "load_held": True,
         }
-
-        ACTIVE_STREAMS[stream_id] = registry_entry
-        stream_entry = registry_entry
-        work_loads[client_index] += 1
 
         queue_maxsize = max(1, prefetch)
         q: asyncio.Queue = asyncio.Queue(maxsize=queue_maxsize)
@@ -225,6 +221,7 @@ class ByteStreamer:
 
             tries = 0
             flood_tries = 0
+            expected = min(chunk_size, file_id.file_size - off)
             while tries < 3 and flood_tries < 5 and not stop_event.is_set():
                 c_idx, c_session, c_loc_box, c_refresh = session_pool[(seq_idx + tries) % len(session_pool)]
                 try:
@@ -238,14 +235,17 @@ class ByteStreamer:
                         timeout=15.0,
                     )
                     chunk_bytes = getattr(r, "bytes", None) if r else None
+                    actual = len(chunk_bytes) if chunk_bytes is not None else 0
 
-                    if chunk_bytes == b"":
-                        return seq_idx, None
+                    if chunk_bytes is None or actual != expected:
+                        LOGGER.warning(
+                            "Unexpected Telegram chunk length at offset %s: expected %s, received %s",
+                            off, expected, actual,
+                        )
+                        raise OSError("Unexpected Telegram chunk length")
 
-                    if cache_key is not None and chunk_bytes and location.id == file_id.media_id:
-                        expected = min(chunk_size, file_id.file_size - off)
-                        if len(chunk_bytes) == expected:
-                            _RECENT_CHUNKS[cache_key] = (time.monotonic() + _RECENT_CHUNK_TTL, chunk_bytes)
+                    if cache_key is not None and location.id == file_id.media_id:
+                        _RECENT_CHUNKS[cache_key] = (time.monotonic() + _RECENT_CHUNK_TTL, chunk_bytes)
 
                     return seq_idx, chunk_bytes
 
@@ -325,6 +325,9 @@ class ByteStreamer:
             await q.put((None, None))
 
         async def consumer_generator():
+            stream_entry["last_ts"] = time.time()
+            ACTIVE_STREAMS[stream_id] = stream_entry
+            work_loads[client_index] += 1
             producer_task = asyncio.create_task(producer())
             current_part_idx = 1
             _disconnect_check_counter = 0
