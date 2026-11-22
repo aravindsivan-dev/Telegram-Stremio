@@ -3,7 +3,6 @@ import random
 import re
 import secrets
 import time
-import traceback
 from collections import deque
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -275,102 +274,40 @@ class ByteStreamer:
             return seq_idx, None
 
         async def producer():
-            scheduled_tasks = {}
-            try:
-                if part_count <= 0:
-                    await q.put((None, None))
-                    return
+            scheduled_tasks = deque()
+            next_to_schedule = 0
+            max_parallel = max(1, parallelism)
 
-                next_to_schedule = 0
-                results_buffer = {}
-                next_to_put = 0
-                max_parallel = max(1, parallelism)
-
-                initial = min(part_count, max_parallel)
-                for i in range(initial):
-                    seq = next_to_schedule
-                    off = offset + seq * chunk_size
-                    task = asyncio.create_task(fetch_chunk_with_retries(seq, off))
-                    scheduled_tasks[seq] = task
+            def fill_window():
+                nonlocal next_to_schedule
+                while len(scheduled_tasks) < max_parallel and next_to_schedule < part_count:
+                    off = offset + next_to_schedule * chunk_size
+                    task = asyncio.create_task(fetch_chunk_with_retries(next_to_schedule, off))
+                    scheduled_tasks.append(task)
                     next_to_schedule += 1
 
-                while next_to_put < part_count:
-                    if stop_event.is_set():
+            try:
+                fill_window()
+                while scheduled_tasks and not stop_event.is_set():
+                    # Keep completed chunks in the same bounded window until their turn.
+                    seq_idx, chunk_bytes = await scheduled_tasks[0]
+                    scheduled_tasks.popleft()
+                    if chunk_bytes is None:
+                        stream_entry["status"] = "error"
                         break
-
-                    if not scheduled_tasks:
-                        seq = next_to_schedule
-                        off = offset + seq * chunk_size
-                        task = asyncio.create_task(fetch_chunk_with_retries(seq, off))
-                        scheduled_tasks[seq] = task
-                        next_to_schedule += 1
-
-                    done, _ = await asyncio.wait(scheduled_tasks.values(), return_when=asyncio.FIRST_COMPLETED)
-
-                    for completed in done:
-                        try:
-                            completed_seq = None
-                            for k, t in list(scheduled_tasks.items()):
-                                if t is completed:
-                                    completed_seq = k
-                                    break
-
-                            if completed_seq is None:
-                                continue
-
-                            seq_idx, chunk_bytes = completed.result()
-                            scheduled_tasks.pop(completed_seq, None)
-
-                            if chunk_bytes is None:
-                                await q.put((None, None))
-                                return
-
-                            results_buffer[seq_idx] = chunk_bytes
-
-                            if next_to_schedule < part_count:
-                                seq = next_to_schedule
-                                off = offset + seq * chunk_size
-                                task = asyncio.create_task(fetch_chunk_with_retries(seq, off))
-                                scheduled_tasks[seq] = task
-                                next_to_schedule += 1
-
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as e:
-                            LOGGER.exception("Error processing completed fetch task: %s%s", e, traceback.format_exc())
-                            await q.put((None, None))
-                            return
-
-                    while next_to_put in results_buffer:
-                        chunk_bytes = results_buffer.pop(next_to_put)
-                        await q.put((offset + next_to_put * chunk_size, chunk_bytes))
-                        next_to_put += 1
-
-                await q.put((None, None))
-
-            except asyncio.CancelledError:
-                try:
-                    await q.put((None, None))
-                except Exception:
-                    pass
-                raise
+                    fill_window()
+                    await q.put((offset + seq_idx * chunk_size, chunk_bytes))
             except Exception as e:
+                stream_entry["status"] = "error"
                 LOGGER.exception("Producer unexpected error for stream %s: %s", stream_id, e)
-                try:
-                    await q.put((None, None))
-                except Exception:
-                    pass
             finally:
                 stop_event.set()
+                for task in scheduled_tasks:
+                    task.cancel()
                 if scheduled_tasks:
-                    for t in scheduled_tasks.values():
-                        if not t.done():
-                            t.cancel()
-                    try:
-                        await asyncio.gather(*scheduled_tasks.values(), return_exceptions=True)
-                    except Exception:
-                        pass
-                    scheduled_tasks.clear()
+                    await asyncio.gather(*scheduled_tasks, return_exceptions=True)
+
+            await q.put((None, None))
 
         async def consumer_generator():
             producer_task = asyncio.create_task(producer())
@@ -453,17 +390,11 @@ class ByteStreamer:
                     current_part_idx += 1
 
             except asyncio.CancelledError:
-                stop_event.set()
-                if not producer_task.done():
-                    producer_task.cancel()
                 stream_entry["status"] = "cancelled"
                 raise
             except Exception as e:
                 LOGGER.exception("Consumer error for stream %s: %s", stream_id, e)
-                stop_event.set()
                 stream_entry["status"] = "error"
-                if not producer_task.done():
-                    producer_task.cancel()
             finally:
                 stop_event.set()
                 if not producer_task.done():
