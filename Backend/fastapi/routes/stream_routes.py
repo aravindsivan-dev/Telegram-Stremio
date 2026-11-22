@@ -44,6 +44,8 @@ _pool: ContextVar = ContextVar("pool", default=None)
 
 _title_cache = BoundedDict(2000)
 _TITLE_CACHE_TTL = 300
+_zip_entry_cache = BoundedDict(128)
+_ZIP_ENTRY_CACHE_TTL = 300
 
 
 #----- Recursively convert non-JSON-native containers to serializable forms
@@ -614,7 +616,22 @@ async def _zip_media_streamer(request, parts_payload, token, token_data, stream_
     async def _read(off, length):
         return await _read_virtual_range(parts, off, length, streamer, request, client_index, parallelism, prefetch_count)
 
-    entry = await resolve_zip_entry(_read, zip_size)
+    cache_key = None
+    entry = None
+    if prefix_100:
+        media_identity = tuple(
+            (part["chat_id"], part["msg_id"], part["file_id"].dc_id, part["file_id"].media_id, part["size"])
+            for part in parts
+        )
+        cache_key = (token, media_identity)
+        cached = _zip_entry_cache.get(cache_key)
+        if cached and cached[0] > time.monotonic():
+            entry = cached[1]
+        else:
+            _zip_entry_cache.pop(cache_key, None)
+
+    if entry is None:
+        entry = await resolve_zip_entry(_read, zip_size)
     if not entry:
         raise HTTPException(status_code=415, detail="Unreadable or incomplete split archive")
     if entry["method"] != 0:
@@ -627,6 +644,8 @@ async def _zip_media_streamer(request, parts_payload, token, token_data, stream_
     data_offset = entry["data_offset"]
     if inner_size <= 0 or data_offset + inner_size > zip_size:
         raise HTTPException(status_code=415, detail="Split archive has an unexpected layout")
+    if cache_key is not None and cache_key not in _zip_entry_cache:
+        _zip_entry_cache[cache_key] = (time.monotonic() + _ZIP_ENTRY_CACHE_TTL, entry)
 
     range_header = request.headers.get("Range", "")
     start, end = parse_range_header(range_header, inner_size)
