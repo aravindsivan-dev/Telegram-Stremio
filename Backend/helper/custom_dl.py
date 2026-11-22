@@ -25,6 +25,10 @@ RECENT_STREAMS = deque(maxlen=20)
 STALE_STREAM_IDLE = 180
 _STALE_CLEANER_STARTED = False
 
+# Keep at most 64 MiB of recently fetched Direct chunks per process.
+_RECENT_CHUNKS = BoundedDict(64)
+_RECENT_CHUNK_TTL = 45
+
 
 async def _cleanup_stale_streams():
     while True:
@@ -142,6 +146,7 @@ class ByteStreamer:
         chat_id: Optional[int] = None,
         message_id: Optional[int] = None,
         extra_clients: Optional[List] = None,
+        rewind_scope: Optional[str] = None,
     ):
         if not stream_id:
             stream_id = secrets.token_hex(8)
@@ -207,16 +212,28 @@ class ByteStreamer:
                 except Exception as e:
                     LOGGER.warning("Skipping extra client %s (session setup failed): %s", ec_idx, e)
 
+        cache_identity = None
+        if rewind_scope and chat_id is not None and message_id is not None and chunk_size == self.CHUNK_SIZE:
+            cache_identity = (rewind_scope, chat_id, message_id, file_id.dc_id, file_id.media_id, file_id.file_size)
+
         async def fetch_chunk_with_retries(seq_idx: int, off: int) -> Tuple[int, Optional[bytes]]:
+            cache_key = (*cache_identity, off) if cache_identity is not None else None
+            if cache_key is not None:
+                cached = _RECENT_CHUNKS.pop(cache_key, None)
+                if cached and cached[0] > time.monotonic():
+                    _RECENT_CHUNKS[cache_key] = cached
+                    return seq_idx, cached[1]
+
             tries = 0
             flood_tries = 0
             while tries < 3 and flood_tries < 5 and not stop_event.is_set():
                 c_idx, c_session, c_loc_box, c_refresh = session_pool[(seq_idx + tries) % len(session_pool)]
                 try:
+                    location = c_loc_box[0]
                     r = await asyncio.wait_for(
                         c_session.send(
                             raw.functions.upload.GetFile(
-                                location=c_loc_box[0], offset=off, limit=chunk_size
+                                location=location, offset=off, limit=chunk_size
                             )
                         ),
                         timeout=15.0,
@@ -225,6 +242,11 @@ class ByteStreamer:
 
                     if chunk_bytes == b"":
                         return seq_idx, None
+
+                    if cache_key is not None and chunk_bytes and location.id == file_id.media_id:
+                        expected = min(chunk_size, file_id.file_size - off)
+                        if len(chunk_bytes) == expected:
+                            _RECENT_CHUNKS[cache_key] = (time.monotonic() + _RECENT_CHUNK_TTL, chunk_bytes)
 
                     return seq_idx, chunk_bytes
 

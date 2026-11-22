@@ -410,6 +410,7 @@ async def media_streamer(request: Request, chat_id: int, msg_id: int, token: str
         chat_id=chat_id,
         message_id=msg_id,
         extra_clients=extra_clients_for_stream,
+        rewind_scope=token,
     )
 
     asyncio.create_task(track_usage(stream_id, token, token_data))
@@ -458,7 +459,7 @@ async def virtual_media_streamer(request: Request, parts_payload: list, token: s
     body_gen = virtual_stream_generator(
         parts=parts, start=start, end=end, chunk_size=chunk_size,
         streamer=streamer, client_index=index, request=request, meta=meta,
-        stream_id=stream_id, parallelism=parallelism, prefetch_count=prefetch_count,
+        stream_id=stream_id, parallelism=parallelism, prefetch_count=prefetch_count, rewind_scope=token,
     )
     return StreamingResponse(body_gen, headers=common_headers, status_code=status, media_type=mime_type)
 
@@ -604,7 +605,7 @@ async def _read_virtual_range(parts, start, length, streamer, request, client_in
 #----- Stream a split ZIP archive (.zip.001/.002 ...) as its inner video, with seeking.
 #----- Only STORED (uncompressed) archives are seekable; the inner file bytes are served
 #----- directly at their offset inside the concatenated zip (no stream-unzip needed).
-async def _zip_media_streamer(request, parts_payload, token, token_data, stream_id_hash, streamer, client_index, prefix_100, parallelism, prefetch_count):
+async def _zip_media_streamer(request, parts_payload, token, token_data, stream_id_hash, streamer, client_index, prefix_100, parallelism, prefetch_count, rewind_scope=None):
     if streamer is None:
         raise HTTPException(status_code=503, detail="ZIP streaming is unavailable (no client/session)")
 
@@ -654,7 +655,7 @@ async def _zip_media_streamer(request, parts_payload, token, token_data, stream_
     body_gen = virtual_stream_generator(
         parts=parts, start=data_offset + start, end=data_offset + end, chunk_size=1024 * 1024,
         streamer=streamer, client_index=client_index, request=request, meta=meta,
-        stream_id=stream_id, parallelism=parallelism, prefetch_count=prefetch_count,
+        stream_id=stream_id, parallelism=parallelism, prefetch_count=prefetch_count, rewind_scope=rewind_scope,
     )
     return StreamingResponse(body_gen, headers=headers, status_code=status, media_type=mime_type)
 
@@ -673,7 +674,7 @@ async def db_zip_media_streamer(request: Request, parts_payload: list, token: st
     parallelism, prefetch_count = _prefetch_for(index)
     return await _zip_media_streamer(
         request, parts_payload, token, token_data, stream_id_hash,
-        streamer, index, True, parallelism, prefetch_count,
+        streamer, index, True, parallelism, prefetch_count, rewind_scope=token,
     )
 
 

@@ -50,6 +50,7 @@ async def virtual_stream_generator(
     stream_id: str,
     parallelism: int,
     prefetch_count: int,
+    rewind_scope: Optional[str] = None,
 ):
     pos = start
     for part in parts:
@@ -83,6 +84,7 @@ async def virtual_stream_generator(
             request=request,
             chat_id=part["chat_id"],
             message_id=part["msg_id"],
+            rewind_scope=rewind_scope,
         )
 
         async for chunk in body_gen:
