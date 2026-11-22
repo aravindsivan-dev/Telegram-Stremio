@@ -14,6 +14,7 @@ from fastapi.responses import Response as PlainResponse
 from fastapi.responses import StreamingResponse
 
 from Backend import db
+from Backend.fastapi.security.credentials import require_auth
 from Backend.fastapi.security.tokens import verify_token
 from Backend.helper.bounded import BoundedDict
 from Backend.helper.analytics import client_ip_from, record_stream_start
@@ -373,8 +374,6 @@ async def media_streamer(request: Request, chat_id: int, msg_id: int, token: str
     decoded_name = unquote(request.path_params.get("name", ""))
     final_title = await _lookup_title(stream_id_hash, decoded_name)
     meta = {
-        "request_path": str(request.url.path),
-        "client_host": request.client.host if request.client else None,
         "title": final_title or file_name,
         "file_name": file_name,
         "user_name": token_data.get("name", "Unknown") if token_data else "Unknown",
@@ -443,8 +442,6 @@ async def virtual_media_streamer(request: Request, parts_payload: list, token: s
     final_title = await _lookup_title(stream_id_hash, decoded_name)
 
     meta = {
-        "request_path": str(request.url.path),
-        "client_host": request.client.host if request.client else None,
         "title": final_title or file_name,
         "file_name": file_name,
         "user_name": token_data.get("name", "Unknown") if token_data else "Unknown",
@@ -503,8 +500,6 @@ async def global_media_streamer(request: Request, chat_id: int, msg_id: int, tok
 
     file_name, mime_type = _resolve_filename_mime(file_id)
     meta = {
-        "request_path": str(request.url.path),
-        "client_host": request.client.host if request.client else None,
         "title": file_name or "global-stream",
         "file_name": file_name,
         "user_name": token_data.get("name", "Unknown") if token_data else "Unknown",
@@ -558,8 +553,6 @@ async def global_virtual_media_streamer(request: Request, parts_payload: list, t
     file_name, mime_type = _resolve_filename_mime(parts[0]["file_id"])
 
     meta = {
-        "request_path": str(request.url.path),
-        "client_host": request.client.host if request.client else None,
         "title": final_title or file_name,
         "file_name": file_name,
         "user_name": token_data.get("name", "Unknown") if token_data else "Unknown",
@@ -655,8 +648,6 @@ async def _zip_media_streamer(request, parts_payload, token, token_data, stream_
     mime_type = mimetypes.guess_type(inner_name)[0] or "video/x-matroska"
 
     meta = {
-        "request_path": str(request.url.path),
-        "client_host": request.client.host if request.client else None,
         "title": (await _lookup_title(stream_id_hash, inner_name)) or inner_name,
         "file_name": inner_name,
         "user_name": token_data.get("name", "Unknown") if token_data else "Unknown",
@@ -695,35 +686,9 @@ async def db_zip_media_streamer(request: Request, parts_payload: list, token: st
     )
 
 
-#----- Live and recent stream telemetry, pruning stale active entries
-@router.get("/stream/stats")
+#----- Live and recent stream telemetry
+@router.get("/stream/stats", dependencies=[Depends(require_auth)])
 async def get_stream_stats():
-    now = time.time()
-    PRUNE_SECONDS = 3
-    INACTIVE_TIMEOUT = 15
-    for sid, info in list(ACTIVE_STREAMS.items()):
-        status = info.get("status", "active")
-        current_bytes = info.get("total_bytes", 0)
-        if "last_bytes" not in info:
-            info["last_bytes"] = current_bytes
-            info["last_activity_ts"] = now
-        if current_bytes > info["last_bytes"]:
-            info["last_bytes"] = current_bytes
-            info["last_activity_ts"] = now
-            info["status"] = "active"
-        else:
-            if now - info["last_activity_ts"] > INACTIVE_TIMEOUT:
-                if status == "active":
-                    info["status"] = "cancelled"
-                    info["end_ts"] = now
-        if info.get("status") in ("cancelled", "error", "finished", "inactive"):
-            last_ts = info.get("end_ts", info.get("last_activity_ts", now))
-            if now - last_ts > PRUNE_SECONDS:
-                try:
-                    RECENT_STREAMS.appendleft(ACTIVE_STREAMS.pop(sid))
-                except KeyError:
-                    pass
-
     active = [
         {
             "stream_id": sid,
@@ -765,16 +730,25 @@ async def get_stream_stats():
         "recent_streams": recent,
         "client_dc_map": client_dc_map,
         "work_loads": work_loads,
-    })
+    }, headers={"Cache-Control": "no-store"})
 
 
 #----- Detailed telemetry for a single stream id
-@router.get("/stream/stats/{stream_id}")
+@router.get("/stream/stats/{stream_id}", dependencies=[Depends(require_auth)])
 async def get_stream_detail(stream_id: str):
     info = ACTIVE_STREAMS.get(stream_id)
-    if info:
-        return JSONResponse(make_json_safe(info))
-    for rec in RECENT_STREAMS:
-        if rec.get("stream_id") == stream_id:
-            return JSONResponse(make_json_safe(rec))
-    raise HTTPException(status_code=404, detail="Stream not found")
+    if info is None:
+        info = next((rec for rec in RECENT_STREAMS if rec.get("stream_id") == stream_id), None)
+    if info is None:
+        raise HTTPException(status_code=404, detail="Stream not found")
+    fields = (
+        "stream_id", "msg_id", "chat_id", "dc_id", "client_index", "status",
+        "start_ts", "last_ts", "end_ts", "duration", "total_bytes", "avg_mbps",
+        "instant_mbps", "peak_mbps", "recent_measurements", "part_count",
+        "prefetch", "parallelism", "chunk_size",
+    )
+    meta_fields = ("title", "file_name", "user_name", "split_parts", "zip_parts", "global_search", "source")
+    detail = {key: info[key] for key in fields if key in info}
+    meta = info.get("meta", {})
+    detail["meta"] = {key: meta[key] for key in meta_fields if key in meta}
+    return JSONResponse(make_json_safe(detail), headers={"Cache-Control": "no-store"})

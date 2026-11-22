@@ -1,3 +1,4 @@
+from contextlib import aclosing
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import Request
@@ -87,8 +88,13 @@ async def virtual_stream_generator(
             rewind_scope=rewind_scope,
         )
 
-        async for chunk in body_gen:
-            yield chunk
+        remaining = local_end - local_start + 1
+        async with aclosing(body_gen):
+            async for chunk in body_gen:
+                remaining -= len(chunk)
+                yield chunk
+        if remaining:
+            return
 
         #----- Stop fetching further parts if the client has disconnected
         if request is not None:
