@@ -76,7 +76,12 @@ class StreamIntegrityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.send.await_count, 2)
 
     async def test_playback_finishes_before_title_lookup_and_preserves_analytics_title(self):
-        reader = object.__new__(custom_dl.ByteStreamer)
+        with (
+            patch.object(custom_dl.ByteStreamer, "_clean_cache", new_callable=AsyncMock),
+            patch.object(custom_dl.ByteStreamer, "_prewarm_sessions", new_callable=AsyncMock),
+            patch.object(custom_dl, "_ensure_stale_cleaner"),
+        ):
+            reader = custom_dl.ByteStreamer(object())
         reader._get_media_session = AsyncMock(return_value=SimpleNamespace(
             send=AsyncMock(return_value=SimpleNamespace(bytes=b"data")),
         ))
