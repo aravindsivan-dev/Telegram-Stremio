@@ -1,3 +1,4 @@
+from asyncio import Task
 from contextlib import aclosing
 from typing import Dict, List, Optional, Tuple
 
@@ -52,6 +53,7 @@ async def virtual_stream_generator(
     parallelism: int,
     prefetch_count: int,
     rewind_scope: Optional[str] = None,
+    title_task: Optional[Task[None]] = None,
 ):
     pos = start
     for part in parts:
@@ -86,6 +88,7 @@ async def virtual_stream_generator(
             chat_id=part["chat_id"],
             message_id=part["msg_id"],
             rewind_scope=rewind_scope,
+            title_task=title_task,
         )
 
         remaining = local_end - local_start + 1
