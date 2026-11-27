@@ -1,4 +1,4 @@
-from asyncio import Task
+import asyncio
 from contextlib import aclosing
 from typing import Dict, List, Optional, Tuple
 
@@ -53,7 +53,7 @@ async def virtual_stream_generator(
     parallelism: int,
     prefetch_count: int,
     rewind_scope: Optional[str] = None,
-    title_task: Optional[Task[None]] = None,
+    title_task: Optional[asyncio.Task[None]] = None,
 ):
     pos = start
     for part in parts:
