@@ -19,6 +19,7 @@ from Backend.fastapi.security.tokens import verify_token
 from Backend.helper.bounded import BoundedDict
 from Backend.helper.analytics import client_ip_from, record_stream_start
 from Backend.helper import own_bots
+from Backend.helper.cf_live import stream_report_is_current
 from Backend.helper.cf_stream import cf_stream_url
 from Backend.helper.custom_dl import ACTIVE_STREAMS, RECENT_STREAMS, ByteStreamer
 from Backend.helper.encrypt import decode_string, encode_string
@@ -709,6 +710,7 @@ async def db_zip_media_streamer(request: Request, parts_payload: list, token: st
 #----- Live and recent stream telemetry
 @router.get("/stream/stats", dependencies=[Depends(require_auth)])
 async def get_stream_stats():
+    now = time.time()
     active = [
         {
             "stream_id": sid,
@@ -725,8 +727,10 @@ async def get_stream_stats():
             "peak_mbps": round(info.get("peak_mbps", 0.0), 3),
             "start_ts": info.get("start_ts"),
             "speed_sampled_at": (info.get("end_ts") or info.get("last_ts")) if info.get("total_bytes") else None,
+            "source": info.get("meta", {}).get("source"),
         }
         for sid, info in ACTIVE_STREAMS.items()
+        if stream_report_is_current(info, now)
     ]
     recent = [
         {
@@ -743,6 +747,7 @@ async def get_stream_stats():
             "avg_mbps": round(info.get("avg_mbps", 0.0), 3),
             "start_ts": info.get("start_ts"),
             "end_ts": info.get("end_ts"),
+            "source": info.get("meta", {}).get("source"),
         }
         for info in RECENT_STREAMS
     ]

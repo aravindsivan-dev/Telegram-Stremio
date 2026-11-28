@@ -214,6 +214,9 @@ class ByteStreamer:
         if not stream_id:
             stream_id = secrets.token_hex(8)
 
+        if meta is None:
+            meta = {}
+        meta["source"] = "direct"
         now = time.time()
         stream_entry = {
             "stream_id": stream_id,
@@ -231,7 +234,7 @@ class ByteStreamer:
             "status": "active",
             "part_count": part_count,
             "prefetch": prefetch,
-            "meta": meta or {},
+            "meta": meta,
             "load_held": True,
         }
 

@@ -5,6 +5,7 @@ import httpx
 
 from Backend import db
 from Backend.helper.bounded import BoundedDict
+from Backend.helper.cf_live import stream_report_is_current
 from Backend.helper.custom_dl import ACTIVE_STREAMS
 from Backend.logger import LOGGER
 
@@ -213,11 +214,17 @@ async def get_activity_overview(page: int = 1, per_page: int = 5) -> dict:
             pass
 
     playing = {}
+    now_ts = time.time()
     for info in ACTIVE_STREAMS.values():
         meta = info.get("meta", {}) or {}
         tok = meta.get("token")
-        if tok and tok in valid_tokens:
-            playing[tok] = meta.get("title") or "Streaming"
+        if tok not in valid_tokens or info.get("status") != "active" or not info.get("total_bytes"):
+            continue
+        if not stream_report_is_current(info, now_ts):
+            continue
+        rank = (info.get("last_ts") or 0, info.get("start_ts") or 0)
+        if tok not in playing or rank > playing[tok][0]:
+            playing[tok] = (rank, meta.get("title") or "Streaming", meta.get("source"))
 
     match = {"_id": {"$in": list(valid_tokens)}} if valid_tokens else {"_id": {"$exists": False}}
     try:
@@ -243,6 +250,7 @@ async def get_activity_overview(page: int = 1, per_page: int = 5) -> dict:
         if token not in valid_tokens:
             continue
         last = d.get("last_active")
+        _, title, source = playing.get(token, (None, None, None))
         online = token in playing
         if not online and last:
             try:
@@ -253,7 +261,8 @@ async def get_activity_overview(page: int = 1, per_page: int = 5) -> dict:
             "token": token,
             "name": d.get("name") or "Unknown",
             "online": online,
-            "now_playing": playing.get(token),
+            "now_playing": title,
+            "playback_source": source,
             "last_title": d.get("last_title"),
             "ip": d.get("ip") or "",
             "country": d.get("country") or "",

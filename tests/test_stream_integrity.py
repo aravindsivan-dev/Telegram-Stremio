@@ -250,6 +250,7 @@ class StreamIntegrityTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await asyncio.wait_for(read(), timeout=2), b"data")
                 stream = next(iter(custom_dl.ACTIVE_STREAMS.values()))
                 self.assertEqual(stream["meta"]["title"], "clip.mkv")
+                self.assertEqual(stream["meta"]["source"], "direct")
                 self.assertFalse(title_recorded.is_set())
             finally:
                 release_title.set()
