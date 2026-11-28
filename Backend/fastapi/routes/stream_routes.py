@@ -162,17 +162,34 @@ async def _db_client(fetch):
     return index, streamer, await fetch(streamer)
 
 
-#----- Resolve a stream title from the TTL cache, DB, or the decoded URL name
-async def _lookup_title(stream_id_hash: str, decoded_name: str):
+async def _lookup_title(stream_id_hash: str | None, fallback: str) -> str:
     if not stream_id_hash:
-        return decoded_name
-    now = time.time()
+        return fallback
     cached = _title_cache.get(stream_id_hash)
-    if cached and now < cached[1]:
-        return cached[0] or decoded_name
-    db_title = await db.get_title_by_stream_id(stream_id_hash)
-    _title_cache[stream_id_hash] = (db_title, now + _TITLE_CACHE_TTL)
-    return db_title or decoded_name
+    if cached and time.monotonic() < cached[1]:
+        return cached[0] or fallback
+    title = await db.get_title_by_stream_id(stream_id_hash)
+    _title_cache[stream_id_hash] = (title, time.monotonic() + _TITLE_CACHE_TTL)
+    return title or fallback
+
+
+#----- Enrich playback analytics without holding up the response body
+def _stream_title_task(stream_id_hash: str | None, meta: dict) -> asyncio.Task[None] | None:
+    if not stream_id_hash:
+        return None
+    cached = _title_cache.get(stream_id_hash)
+    if cached and time.monotonic() < cached[1]:
+        if cached[0]:
+            meta["title"] = cached[0]
+        return None
+
+    async def enrich():
+        try:
+            meta["title"] = await _lookup_title(stream_id_hash, meta["title"])
+        except Exception as exc:
+            LOGGER.warning("Stream title lookup failed (%s)", type(exc).__name__)
+
+    return asyncio.create_task(enrich())
 
 
 #----- Derive a display file name and mime type from file properties
@@ -372,9 +389,8 @@ async def media_streamer(request: Request, chat_id: int, msg_id: int, token: str
 
     stream_id = secrets.token_hex(8)
     decoded_name = unquote(request.path_params.get("name", ""))
-    final_title = await _lookup_title(stream_id_hash, decoded_name)
     meta = {
-        "title": final_title or file_name,
+        "title": decoded_name or file_name,
         "file_name": file_name,
         "user_name": token_data.get("name", "Unknown") if token_data else "Unknown",
         "token": token,
@@ -399,6 +415,7 @@ async def media_streamer(request: Request, chat_id: int, msg_id: int, token: str
         results = await asyncio.gather(*[_get_extra_file_id(i) for i in other_indices[:parallelism - 1]])
         extra_clients_for_stream = [r for r in results if r is not None]
 
+    title_task = _stream_title_task(stream_id_hash, meta)
     body_gen = await streamer.prefetch_stream(
         file_id=file_id,
         client_index=index,
@@ -416,6 +433,7 @@ async def media_streamer(request: Request, chat_id: int, msg_id: int, token: str
         message_id=msg_id,
         extra_clients=extra_clients_for_stream,
         rewind_scope=token,
+        title_task=title_task,
     )
 
     asyncio.create_task(track_usage(stream_id, token, token_data))
@@ -439,10 +457,8 @@ async def virtual_media_streamer(request: Request, parts_payload: list, token: s
 
     stream_id = secrets.token_hex(8)
     decoded_name = unquote(request.path_params.get("name", ""))
-    final_title = await _lookup_title(stream_id_hash, decoded_name)
-
     meta = {
-        "title": final_title or file_name,
+        "title": decoded_name or file_name,
         "file_name": file_name,
         "user_name": token_data.get("name", "Unknown") if token_data else "Unknown",
         "token": token,
@@ -457,6 +473,7 @@ async def virtual_media_streamer(request: Request, parts_payload: list, token: s
         parts=parts, start=start, end=end, chunk_size=chunk_size,
         streamer=streamer, client_index=index, request=request, meta=meta,
         stream_id=stream_id, parallelism=parallelism, prefetch_count=prefetch_count, rewind_scope=token,
+        title_task=_stream_title_task(stream_id_hash, meta),
     )
     return StreamingResponse(body_gen, headers=common_headers, status_code=status, media_type=mime_type)
 
@@ -507,13 +524,12 @@ async def global_media_streamer(request: Request, chat_id: int, msg_id: int, tok
         "global_search": True,
     }
 
-    asyncio.create_task(track_usage(stream_id, token, token_data))
-
     headers, status = _build_stream_headers(mime_type, file_name, req_length, range_header, start, end, file_size)
 
     if request.method == "HEAD":
         return PlainResponse(status_code=status, headers=headers)
 
+    asyncio.create_task(track_usage(stream_id, token, token_data))
     body_gen = await streamer.prefetch_stream(
         file_id=file_id,
         client_index=USERBOT_CLIENT_INDEX,
@@ -546,14 +562,15 @@ async def global_virtual_media_streamer(request: Request, parts_payload: list, t
     range_header = request.headers.get("Range", "")
     start, end = parse_range_header(range_header, file_size)
     req_length = end - start + 1
-    chunk_size = 1024 * 1024
+    file_name, mime_type = _resolve_filename_mime(parts[0]["file_id"])
+    headers, status = _build_stream_headers(mime_type, file_name, req_length, range_header, start, end, file_size)
+    if request.method == "HEAD":
+        return PlainResponse(status_code=status, headers=headers)
+
     stream_id = secrets.token_hex(8)
     decoded_name = unquote(request.path_params.get("name", ""))
-    final_title = await _lookup_title(stream_id_hash, decoded_name)
-    file_name, mime_type = _resolve_filename_mime(parts[0]["file_id"])
-
     meta = {
-        "title": final_title or file_name,
+        "title": decoded_name or file_name,
         "file_name": file_name,
         "user_name": token_data.get("name", "Unknown") if token_data else "Unknown",
         "token": token,
@@ -563,15 +580,11 @@ async def global_virtual_media_streamer(request: Request, parts_payload: list, t
 
     asyncio.create_task(track_usage(stream_id, token, token_data))
 
-    headers, status = _build_stream_headers(mime_type, file_name, req_length, range_header, start, end, file_size)
-
-    if request.method == "HEAD":
-        return PlainResponse(status_code=status, headers=headers)
-
     body_gen = virtual_stream_generator(
-        parts=parts, start=start, end=end, chunk_size=chunk_size,
+        parts=parts, start=start, end=end, chunk_size=1024 * 1024,
         streamer=streamer, client_index=USERBOT_CLIENT_INDEX, request=request, meta=meta,
         stream_id=stream_id, parallelism=1, prefetch_count=1,
+        title_task=_stream_title_task(stream_id_hash, meta),
     )
     return StreamingResponse(body_gen, headers=headers, status_code=status, media_type=mime_type)
 
@@ -646,9 +659,12 @@ async def _zip_media_streamer(request, parts_payload, token, token_data, stream_
     stream_id = secrets.token_hex(8)
     inner_name = (entry.get("name") or "").split("/")[-1] or unquote(request.path_params.get("name", "")) or "video.mkv"
     mime_type = mimetypes.guess_type(inner_name)[0] or "video/x-matroska"
+    headers, status = _build_stream_headers(mime_type, inner_name, req_length, range_header, start, end, inner_size)
+    if request.method == "HEAD":
+        return PlainResponse(status_code=status, headers=headers)
 
     meta = {
-        "title": (await _lookup_title(stream_id_hash, inner_name)) or inner_name,
+        "title": inner_name,
         "file_name": inner_name,
         "user_name": token_data.get("name", "Unknown") if token_data else "Unknown",
         "token": token,
@@ -656,14 +672,11 @@ async def _zip_media_streamer(request, parts_payload, token, token_data, stream_
     }
     asyncio.create_task(track_usage(stream_id, token, token_data))
 
-    headers, status = _build_stream_headers(mime_type, inner_name, req_length, range_header, start, end, inner_size)
-    if request.method == "HEAD":
-        return PlainResponse(status_code=status, headers=headers)
-
     body_gen = virtual_stream_generator(
         parts=parts, start=data_offset + start, end=data_offset + end, chunk_size=1024 * 1024,
         streamer=streamer, client_index=client_index, request=request, meta=meta,
         stream_id=stream_id, parallelism=parallelism, prefetch_count=prefetch_count, rewind_scope=rewind_scope,
+        title_task=_stream_title_task(stream_id_hash, meta),
     )
     return StreamingResponse(body_gen, headers=headers, status_code=status, media_type=mime_type)
 

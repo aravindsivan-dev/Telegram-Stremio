@@ -3,6 +3,7 @@ import os
 import time
 import unittest
 from collections import deque
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -19,7 +20,7 @@ with patch.dict(os.environ, {
     from Backend import db
     from Backend.fastapi.main import auth_exception_handler
     from Backend.fastapi.routes import stream_routes
-    from Backend.helper import custom_dl, virtual_dl
+    from Backend.helper import cf_live, custom_dl, virtual_dl
 
 
 class StreamIntegrityTests(unittest.IsolatedAsyncioTestCase):
@@ -119,8 +120,156 @@ class StreamIntegrityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([chunk async for chunk in stream], [b"abcd"])
             self.assertEqual(custom_dl.ACTIVE_STREAMS["test-refresh"]["status"], "error")
             self.assertEqual(custom_dl.work_loads[0], 0)
+            await asyncio.sleep(0)
         self.assertIs(reader._file_id_cache[123, 1], replacement)
         self.assertEqual(session.send.await_count, 2)
+
+    async def test_playback_finishes_before_title_lookup_and_preserves_analytics_title(self):
+        with (
+            patch.object(custom_dl.ByteStreamer, "_clean_cache", new_callable=AsyncMock),
+            patch.object(custom_dl.ByteStreamer, "_prewarm_sessions", new_callable=AsyncMock),
+            patch.object(custom_dl, "_ensure_stale_cleaner"),
+        ):
+            reader = custom_dl.ByteStreamer(object())
+        reader._get_media_session = AsyncMock(return_value=SimpleNamespace(
+            send=AsyncMock(return_value=SimpleNamespace(bytes=b"data")),
+        ))
+        reader._get_location = AsyncMock(return_value=SimpleNamespace(id=1))
+        file_id = SimpleNamespace(dc_id=1, media_id=1, file_size=4, file_name="clip.mkv", mime_type=None)
+        release_title = asyncio.Event()
+        title_recorded = asyncio.Event()
+        saved_titles = []
+
+        async def get_title(_):
+            await release_title.wait()
+            return "Library title"
+
+        async def persist(entry):
+            saved_titles.append(entry["meta"]["title"])
+            title_recorded.set()
+
+        request = Request({
+            "type": "http", "method": "GET",
+            "headers": [(b"range", b"bytes=0-3")],
+            "path_params": {"name": "clip.mkv"},
+        })
+        with (
+            patch.object(stream_routes, "_db_client", new=AsyncMock(return_value=(0, reader, file_id))),
+            patch.object(stream_routes, "_prefetch_for", return_value=(1, 1)),
+            patch.object(stream_routes, "track_usage", new_callable=AsyncMock),
+            patch.object(stream_routes, "_title_cache", {}),
+            patch.object(custom_dl, "_RECENT_CHUNKS", {}),
+            patch.object(custom_dl, "ACTIVE_STREAMS", {}),
+            patch.object(custom_dl, "work_loads", {0: 0}),
+            patch.object(custom_dl, "client_avg_mbps", {0: 0}),
+            patch.object(db, "get_title_by_stream_id", side_effect=get_title),
+            patch.object(db, "log_stream_stats", side_effect=persist),
+        ):
+            async def read():
+                response = await stream_routes.media_streamer(request, 123, 1, "fixture", stream_id_hash="id")
+                self.assertEqual(response.status_code, 206)
+                return b"".join([piece async for piece in response.body_iterator])
+
+            try:
+                self.assertEqual(await asyncio.wait_for(read(), timeout=2), b"data")
+                stream = next(iter(custom_dl.ACTIVE_STREAMS.values()))
+                self.assertEqual(stream["meta"]["title"], "clip.mkv")
+                self.assertFalse(title_recorded.is_set())
+            finally:
+                release_title.set()
+            await asyncio.wait_for(title_recorded.wait(), timeout=2)
+            self.assertEqual(saved_titles, ["Library title"])
+            self.assertEqual(stream["meta"]["title"], "Library title")
+
+    async def test_title_lookup_error_keeps_the_playback_filename(self):
+        meta = {"title": "clip.mkv"}
+        with (
+            patch.object(stream_routes, "_title_cache", {}),
+            patch.object(db, "get_title_by_stream_id", side_effect=RuntimeError("Database unavailable")),
+        ):
+            await stream_routes._stream_title_task("id", meta)
+            self.assertEqual(meta["title"], "clip.mkv")
+            self.assertNotIn("id", stream_routes._title_cache)
+
+    async def test_global_split_head_skips_playback_bookkeeping(self):
+        file_id = SimpleNamespace(file_size=4, file_name="clip.mkv", mime_type=None)
+        request = Request({"type": "http", "method": "HEAD", "headers": [(b"range", b"bytes=0-1")]})
+        with (
+            patch.object(stream_routes, "_get_userbot_streamer", return_value=object()),
+            patch.object(stream_routes, "resolve_virtual_parts", new=AsyncMock(return_value=([{"file_id": file_id}], 4))),
+            patch.object(stream_routes, "track_usage", new_callable=AsyncMock) as track_usage,
+            patch.object(db, "get_title_by_stream_id", new_callable=AsyncMock) as get_title,
+        ):
+            response = await stream_routes.global_virtual_media_streamer(request, [], "fixture", stream_id_hash="id")
+            self.assertEqual(response.status_code, 206)
+            self.assertEqual(response.headers["Content-Range"], "bytes 0-1/4")
+            self.assertEqual(response.headers["Content-Length"], "2")
+            self.assertEqual(response.body, b"")
+            track_usage.assert_not_called()
+            get_title.assert_not_called()
+
+
+class StreamAnalyticsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_late_title_is_ordered_by_stream_end_and_preserves_activity_count(self):
+        allow_lookup = asyncio.Event()
+        async def lookup(_):
+            await allow_lookup.wait()
+            return "$Older"
+
+        analytics = SimpleNamespace(insert_one=AsyncMock())
+        activity = SimpleNamespace(update_one=AsyncMock())
+        newer = {"stream_id": "newer", "end_ts": 2.5, "meta": {"token": "viewer", "title": "$Newer"}}
+        older = {"stream_id": "older", "end_ts": 1.5, "meta": {"token": "viewer", "title": "older.mkv"}}
+        with (
+            patch.object(stream_routes, "_title_cache", {}),
+            patch.object(db, "get_title_by_stream_id", side_effect=lookup),
+            patch.object(db, "dbs", {"tracking": {"stream_analytics": analytics, "user_activity": activity}}),
+        ):
+            title_task = stream_routes._stream_title_task("older-id", older["meta"])
+            pending = asyncio.create_task(custom_dl._persist_stream_stats(older, title_task))
+            try:
+                await custom_dl._persist_stream_stats(newer, None)
+            finally:
+                allow_lookup.set()
+                await pending
+
+        self.assertEqual([call.args[0]["title"] for call in analytics.insert_one.await_args_list], ["$Newer", "$Older"])
+        self.assertEqual(activity.update_one.await_count, 2)
+        for call, entry in zip(activity.update_one.await_args_list, (newer, older)):
+            expected_end = entry["end_ts"]
+            last_title_end = {"$ifNull": ["$last_title_end_ts", 0]}
+            self.assertEqual(call.args[0], {"_id": "viewer"})
+            self.assertEqual(call.kwargs, {"upsert": True})
+            self.assertEqual(call.args[1], [{"$set": {
+                "last_active": {"$max": ["$last_active", datetime.fromtimestamp(expected_end, timezone.utc)]},
+                "streams": {"$add": [{"$ifNull": ["$streams", 0]}, 1]},
+                "last_title": {
+                    "$cond": [{"$gte": [expected_end, last_title_end]}, {"$literal": entry["meta"]["title"]}, "$last_title"],
+                },
+                "last_title_end_ts": {"$max": [expected_end, last_title_end]},
+            }}])
+
+    async def test_cloudflare_reports_resolve_titles_and_finish_streams(self):
+        active = {}
+        recent = deque()
+        with (
+            patch.object(cf_live, "ACTIVE_STREAMS", active),
+            patch.object(cf_live, "RECENT_STREAMS", recent),
+            patch.object(stream_routes, "_title_cache", {}),
+            patch.object(db, "get_title_by_stream_id", new=AsyncMock(return_value="Cloudflare title")),
+            patch.object(db, "get_api_token", new=AsyncMock(return_value={"name": "Viewer"})),
+            patch.object(db, "log_stream_stats", new_callable=AsyncMock) as log_stats,
+        ):
+            await cf_live.apply_report("worker", None, 1, [{
+                "id": "clip", "token": "viewer", "file": "file-id", "name": "clip.mkv",
+                "bytes": 1048576, "since": 1000, "last": 3500,
+            }])
+            self.assertEqual(active["cf-clip"]["meta"]["title"], "Cloudflare title")
+            await cf_live.apply_report("worker", None, 1, [])
+            await asyncio.sleep(0)
+        self.assertFalse(active)
+        self.assertEqual(recent[0]["end_ts"], 3.5)
+        log_stats.assert_awaited_once_with(recent[0])
 
 
 class StreamDashboardTests(unittest.TestCase):

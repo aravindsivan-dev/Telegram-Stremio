@@ -33,6 +33,12 @@ def _media_identity(file_id: FileId) -> tuple[int, int, int]:
     return file_id.dc_id, file_id.media_id, file_id.file_size
 
 
+async def _persist_stream_stats(entry: dict, title_task: Optional[asyncio.Task[None]]) -> None:
+    if title_task is not None:
+        await asyncio.shield(title_task)
+    await db.log_stream_stats(entry)
+
+
 async def _cleanup_stale_streams():
     while True:
         try:
@@ -150,6 +156,7 @@ class ByteStreamer:
         message_id: Optional[int] = None,
         extra_clients: Optional[List] = None,
         rewind_scope: Optional[str] = None,
+        title_task: Optional[asyncio.Task[None]] = None,
     ):
         if not stream_id:
             stream_id = secrets.token_hex(8)
@@ -450,7 +457,7 @@ class ByteStreamer:
                     else:
                         client_avg_mbps[client_index] = 0.5 * prev + 0.5 * avg_mbps
 
-                    asyncio.create_task(db.log_stream_stats(stream_entry))
+                    asyncio.create_task(_persist_stream_stats(stream_entry, title_task))
 
                     async def delayed_pop():
                         await asyncio.sleep(3)
