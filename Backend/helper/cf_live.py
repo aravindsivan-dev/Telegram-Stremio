@@ -10,9 +10,9 @@ MIB = 1024 * 1024
 _REPORT_FRESHNESS_SECONDS = 60
 
 
-def stream_report_is_current(entry: dict, now: float) -> bool:
-    """Allow several missed 15-second Worker reports before hiding a stale stream."""
-    return (
+def is_active_stream(entry: dict, now: float) -> bool:
+    """Treat Worker streams as active while their periodic reports are current."""
+    return entry.get("status") == "active" and (
         entry.get("meta", {}).get("source") != "cloudflare"
         or now - entry.get("reported_at", 0) <= _REPORT_FRESHNESS_SECONDS
     )

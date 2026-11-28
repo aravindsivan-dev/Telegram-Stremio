@@ -19,7 +19,7 @@ from Backend.fastapi.security.tokens import verify_token
 from Backend.helper.bounded import BoundedDict
 from Backend.helper.analytics import client_ip_from, record_stream_start
 from Backend.helper import own_bots
-from Backend.helper.cf_live import stream_report_is_current
+from Backend.helper.cf_live import is_active_stream
 from Backend.helper.cf_stream import cf_stream_url
 from Backend.helper.custom_dl import ACTIVE_STREAMS, RECENT_STREAMS, ByteStreamer
 from Backend.helper.encrypt import decode_string, encode_string
@@ -730,7 +730,7 @@ async def get_stream_stats():
             "source": info.get("meta", {}).get("source"),
         }
         for sid, info in ACTIVE_STREAMS.items()
-        if stream_report_is_current(info, now)
+        if is_active_stream(info, now)
     ]
     recent = [
         {
