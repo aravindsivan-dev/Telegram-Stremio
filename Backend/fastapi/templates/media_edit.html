@@ -1554,7 +1554,7 @@
         const isErr = !!r.error && !r.speed_mbps;
         const ping = r.ping_ms !== null ? `<span class="${_pingClass(r.ping_ms)}">${r.ping_ms} ms</span>` : '<span class="text-text-secondary">—</span>';
         const speed = r.speed_mbps !== null
-            ? `<span class="${_speedClass(r.speed_mbps)}">${r.speed_mbps.toFixed(2)} MB/s</span>
+            ? `<span class="${_speedClass(r.speed_mbps)}">${r.speed_mbps.toFixed(2)} MiB/s</span>
                ${_miniBar(r.speed_mbps, maxSpeed, r.speed_mbps >= 20 ? 'bg-emerald-400' : r.speed_mbps >= 5 ? 'bg-amber-300' : 'bg-rose-300')}`
             : '<span class="text-text-secondary">—</span>';
         const badge = isErr
@@ -1600,7 +1600,7 @@
             if (!summaryEl) return;
 
             if (best) {
-                summaryEl.textContent = `Fastest: DC ${best.dc_id} — ${best.speed_mbps.toFixed(2)} MB/s | ${completedCount}/${totalCount} client(s) done`;
+                summaryEl.textContent = `Fastest: DC ${best.dc_id} — ${best.speed_mbps.toFixed(2)} MiB/s | ${completedCount}/${totalCount} client(s) done`;
             } else {
                 summaryEl.textContent = `${completedCount}/${totalCount} client(s) done`;
             }

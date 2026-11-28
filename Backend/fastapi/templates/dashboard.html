@@ -302,7 +302,9 @@
         const title = escapeHtml(getStreamTitle(stream));
         const fileName = escapeHtml(getStreamFileName(stream));
         const label = escapeHtml(getClientLabel(stream));
-        const avgSpeed = stream?.avg_mbps != null ? Number(stream.avg_mbps).toFixed(2) + ' MB/s' : '—';
+        const sampledAt = formatTimestamp(stream?.speed_sampled_at);
+        const avgSpeed = sampledAt !== '—' && stream?.avg_mbps != null
+            ? Number(stream.avg_mbps).toFixed(2) + ' MiB/s' : '—';
         return `
             <div class="stream-card">
                 <div class="flex items-start justify-between gap-3 min-w-0">
@@ -313,10 +315,11 @@
                     <span class="text-[11px] px-2 py-0.5 rounded-full whitespace-nowrap shrink-0 ${status.className}">${escapeHtml(status.text)}</span>
                 </div>
                 <div class="grid grid-cols-3 gap-2 mt-3 text-xs">
-                    <div class="min-w-0"><p class="text-text-secondary">Speed</p><p class="font-medium tabular truncate">${avgSpeed}</p></div>
+                    <div class="min-w-0"><p class="text-text-secondary">Average speed</p><p class="font-medium tabular truncate">${avgSpeed}</p></div>
                     <div class="min-w-0"><p class="text-text-secondary">Sent</p><p class="font-medium tabular truncate">${escapeHtml(formatBytes(stream?.total_bytes || 0))}</p></div>
                     <div class="min-w-0"><p class="text-text-secondary">Time</p><p class="font-medium tabular truncate live-duration">${escapeHtml(getLiveDuration(stream))}</p></div>
                 </div>
+                ${sampledAt !== '—' ? `<p class="mt-2 text-xs text-text-secondary">Speed sampled ${escapeHtml(sampledAt)}</p>` : ''}
                 <p class="mt-3 pt-3 border-t border-border text-xs text-text-secondary truncate">${label} · <span class="font-mono">${escapeHtml(String(stream?.stream_id || '').slice(0, 12))}</span> · ${escapeHtml(formatTimestamp(stream?.start_ts))}</p>
             </div>
         `;

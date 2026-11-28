@@ -287,7 +287,7 @@
                     </tr>`;
                 }).join('');
                 workloadsWrap.innerHTML = `<div class="bot-table-wrap"><table class="bot-table">
-                    <thead><tr><th>Client</th><th>DC</th><th>Load</th><th>Avg MB/s</th></tr></thead>
+                    <thead><tr><th>Client</th><th>DC</th><th>Load</th><th>Avg MiB/s</th></tr></thead>
                     <tbody>${rows}</tbody></table></div>`;
             } else {
                 workloadsWrap.innerHTML = '<div class="empty-state">No bot data available</div>';
@@ -362,7 +362,7 @@
         const s = d.summary || {};
         insText('ins-total-streams', s.total_streams ?? 0);
         insText('ins-total-data', fmtBytes(s.total_bytes));
-        insText('ins-avg-speed', (Number(s.avg_speed || 0)).toFixed(1) + ' MB/s');
+        insText('ins-avg-speed', (Number(s.avg_speed || 0)).toFixed(1) + ' MiB/s');
         insText('ins-active-users', s.active_users ?? 0);
 
         const titles = d.top_titles || [];
@@ -428,7 +428,7 @@
                         <td><div class="title-cell font-semibold" title="${escapeHtml(titleStr)}">${escapeHtml(titleStr)}</div></td>
                         <td class="text-center">Bot ${Number(s.client_index ?? 0) + 1} <span class="muted text-xs ml-1">(DC${escapeHtml(s.dc_id)})</span></td>
                         <td class="text-right font-semibold">${bytesStr}</td>
-                        <td class="text-right font-semibold">${avg.toFixed(1)} <span class="muted">/ ${peak.toFixed(1)} MB/s</span></td>
+                        <td class="text-right font-semibold">${avg.toFixed(1)} <span class="muted">/ ${peak.toFixed(1)} MiB/s</span></td>
                         <td class="text-center muted">${durationStr}</td>
                         <td class="text-center"><span class="${getStatusBadge(status)}">${escapeHtml(status)}</span></td>
                         <td class="text-right muted text-xs">${timeStr}</td>
@@ -444,7 +444,7 @@
                         <div class="flex flex-wrap gap-x-3 gap-y-1 muted text-xs mt-2">
                             <span>Bot ${Number(s.client_index ?? 0) + 1} · DC${escapeHtml(s.dc_id)}</span>
                             <span class="font-semibold text-text">${bytesStr}</span>
-                            <span>${avg.toFixed(1)}/${peak.toFixed(1)} MB/s</span>
+                            <span>${avg.toFixed(1)}/${peak.toFixed(1)} MiB/s</span>
                             <span>${durationStr}</span>
                             <span>${timeStr}</span>
                         </div>
