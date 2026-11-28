@@ -64,17 +64,20 @@ async def verify_token(token: str):
                 token_data["subscription_expired"] = True
                 return token_data
 
+    now = datetime.now(timezone.utc)
     if daily_limit := limits.get("daily_limit_gb"):
-        if daily_limit > 0:
-            current_daily_gb = usage.get("daily", {}).get("bytes", 0) / (1024 ** 3)
+        daily = usage.get("daily") or {}
+        if daily_limit > 0 and daily.get("date") == now.strftime("%Y-%m-%d"):
+            current_daily_gb = daily.get("bytes", 0) / (1024 ** 3)
             if current_daily_gb >= daily_limit:
                 token_data["limit_exceeded"] = "daily"
                 token_data["limit_video"] = DAILY_LIMIT_VIDEO
                 return token_data
 
     if monthly_limit := limits.get("monthly_limit_gb"):
-        if monthly_limit > 0:
-            current_monthly_gb = usage.get("monthly", {}).get("bytes", 0) / (1024 ** 3)
+        monthly = usage.get("monthly") or {}
+        if monthly_limit > 0 and monthly.get("month") == now.strftime("%Y-%m"):
+            current_monthly_gb = monthly.get("bytes", 0) / (1024 ** 3)
             if current_monthly_gb >= monthly_limit:
                 token_data["limit_exceeded"] = "monthly"
                 token_data["limit_video"] = MONTHLY_LIMIT_VIDEO
