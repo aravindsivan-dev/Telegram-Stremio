@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import aclosing
 from typing import Dict, List, Optional, Tuple
 
@@ -13,13 +14,36 @@ async def resolve_virtual_parts(
     streamer: ByteStreamer,
     prefix_100: bool = True,
 ) -> Tuple[List[Dict], int]:
+    references = [(int(part["chat_id"]), int(part["msg_id"])) for part in parts_payload]
+    if prefix_100:
+        references = [(int(f"-100{chat_id}") if chat_id > 0 else chat_id, msg_id) for chat_id, msg_id in references]
+
+    # A cold split request needs every part's size. Overlap two lookups without
+    # making the number of parallel Telegram calls depend on the archive size.
+    unique = list(dict.fromkeys(references))
+    properties = {}
+    for start in range(0, len(unique), 2):
+        batch = unique[start:start + 2]
+        if len(batch) == 1:
+            chat_id, msg_id = batch[0]
+            properties[batch[0]] = await streamer.get_file_properties(chat_id=chat_id, message_id=msg_id)
+            continue
+        tasks = [
+            asyncio.create_task(streamer.get_file_properties(chat_id=chat_id, message_id=msg_id))
+            for chat_id, msg_id in batch
+        ]
+        try:
+            properties.update(zip(batch, await asyncio.gather(*tasks)))
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
     parts: List[Dict] = []
     cum = 0
-    for idx, p in enumerate(parts_payload):
-        raw_chat = int(p["chat_id"])
-        chat_id = int(f"-100{raw_chat}") if prefix_100 and raw_chat > 0 else raw_chat
-        msg_id = int(p["msg_id"])
-        file_id = await streamer.get_file_properties(chat_id=chat_id, message_id=msg_id)
+    for idx, (chat_id, msg_id) in enumerate(references):
+        file_id = properties[(chat_id, msg_id)]
         size = file_id.file_size
         parts.append({
             "index": idx,

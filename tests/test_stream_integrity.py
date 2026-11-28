@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 import unittest
@@ -22,6 +23,54 @@ with patch.dict(os.environ, {
 
 
 class StreamIntegrityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_split_resolves_two_parts_at_a_time_and_preserves_offsets(self):
+        started = []
+        completed = []
+        release_first = asyncio.Event()
+
+        async def get_file_properties(chat_id, message_id):
+            started.append((chat_id, message_id))
+            if message_id == 1:
+                await release_first.wait()
+            if message_id == 2:
+                release_first.set()
+            completed.append(message_id)
+            return SimpleNamespace(file_size=message_id * 10)
+
+        streamer = SimpleNamespace(get_file_properties=get_file_properties)
+        parts, size = await asyncio.wait_for(virtual_dl.resolve_virtual_parts(
+            [{"chat_id": 123, "msg_id": msg_id} for msg_id in (1, 2, 3, 1)],
+            streamer,
+        ), timeout=2)
+        self.assertEqual(started, [(-100123, 1), (-100123, 2), (-100123, 3)])
+        self.assertEqual(completed, [2, 1, 3])
+        self.assertEqual([part["cum_start"] for part in parts], [0, 10, 30, 60])
+        self.assertEqual([part["msg_id"] for part in parts], [1, 2, 3, 1])
+        self.assertEqual(size, 70)
+
+    async def test_split_cancels_peer_lookup_after_a_part_fails(self):
+        peer_started = asyncio.Event()
+        peer_cancelled = asyncio.Event()
+
+        async def get_file_properties(chat_id, message_id):
+            self.assertEqual(chat_id, 123)
+            if message_id == 1:
+                await peer_started.wait()
+                raise FileNotFoundError("Part unavailable")
+            peer_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                peer_cancelled.set()
+
+        streamer = SimpleNamespace(get_file_properties=get_file_properties)
+        with self.assertRaisesRegex(FileNotFoundError, "Part unavailable"):
+            await asyncio.wait_for(virtual_dl.resolve_virtual_parts(
+                [{"chat_id": 123, "msg_id": 1}, {"chat_id": 123, "msg_id": 2}],
+                streamer, prefix_100=False,
+            ), timeout=2)
+        self.assertTrue(peer_cancelled.is_set())
+
     async def test_split_stops_after_partial_download(self):
         first = SimpleNamespace(file_size=8)
         second = SimpleNamespace(file_size=4)
