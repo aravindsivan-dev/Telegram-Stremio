@@ -2458,36 +2458,23 @@ class Database:
             return False
 
     async def update_token_usage(self, token: str, bytes_delta: int):
-        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        month_str = datetime.now(timezone.utc).strftime("%Y-%m")
-        
-        token_doc = await self.dbs["tracking"]["api_tokens"].find_one({"token": token})
-        if not token_doc:
-             return
+        def bucket_update(bucket, period_key, date_format):
+            current_period = {"$dateToString": {"date": "$$NOW", "format": date_format, "timezone": "UTC"}}
+            previous_bytes = {"$ifNull": [f"$usage.{bucket}.bytes", 0]}
+            same_period = {"$eq": [f"$usage.{bucket}.{period_key}", current_period]}
+            return {
+                period_key: current_period,
+                "bytes": {"$add": [{"$cond": [same_period, previous_bytes, 0]}, bytes_delta]},
+            }
 
-        current_daily = token_doc.get("usage", {}).get("daily", {})
-        if current_daily.get("date") != today_str:
-            await self.dbs["tracking"]["api_tokens"].update_one(
-                {"token": token},
-                {"$set": {"usage.daily": {"date": today_str, "bytes": 0}}}
-            )
-
-        current_monthly = token_doc.get("usage", {}).get("monthly", {})
-        if current_monthly.get("month") != month_str:
-            await self.dbs["tracking"]["api_tokens"].update_one(
-                {"token": token},
-                {"$set": {"usage.monthly": {"month": month_str, "bytes": 0}}}
-            )
-
+        # Roll over and increment in a single update so concurrent reports cannot reset each other.
         await self.dbs["tracking"]["api_tokens"].update_one(
             {"token": token},
-            {
-                "$inc": {
-                    "usage.total_bytes": bytes_delta,
-                    "usage.daily.bytes": bytes_delta,
-                    "usage.monthly.bytes": bytes_delta
-                }
-            }
+            [{"$set": {
+                "usage.total_bytes": {"$add": [{"$ifNull": ["$usage.total_bytes", 0]}, bytes_delta]},
+                "usage.daily": bucket_update("daily", "date", "%Y-%m-%d"),
+                "usage.monthly": bucket_update("monthly", "month", "%Y-%m"),
+            }}],
         )
 
     async def update_api_token_limits(self, token: str, daily_limit_gb: float, monthly_limit_gb: float) -> bool:
