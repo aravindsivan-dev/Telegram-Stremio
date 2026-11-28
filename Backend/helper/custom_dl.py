@@ -4,7 +4,9 @@ import re
 import secrets
 import time
 from collections import deque
-from typing import Dict, List, Optional, Tuple, Union
+from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fastapi import Request
 from pyrogram import Client, raw
@@ -27,6 +29,12 @@ _STALE_CLEANER_STARTED = False
 # Keep at most 64 MiB of recently fetched Direct chunks per process.
 _RECENT_CHUNKS = BoundedDict(64)
 _RECENT_CHUNK_TTL = 45
+
+
+@dataclass
+class _PendingPageRead:
+    task: asyncio.Task[bytes | None]
+    readers: int = 0
 
 
 def _media_identity(file_id: FileId) -> tuple[int, int, int]:
@@ -86,6 +94,7 @@ class ByteStreamer:
         self.client_index = client_index
         self._file_id_cache = BoundedDict(2000)
         self._session_lock = asyncio.Lock()
+        self._pending_page_reads: dict[tuple, _PendingPageRead] = {}
         if client_index >= 0:
             ByteStreamer._instances[client_index] = self
         asyncio.create_task(self._clean_cache())
@@ -136,6 +145,22 @@ class ByteStreamer:
                 raise FileNotFound
             self._file_id_cache[cache_key] = file_id
         return self._file_id_cache[cache_key]
+
+    async def _share_page_read(self, key: tuple, download: Callable[[], Coroutine[Any, Any, bytes | None]]) -> bytes | None:
+        pending = self._pending_page_reads.get(key)
+        if pending is None:
+            pending = _PendingPageRead(asyncio.create_task(download()))
+            self._pending_page_reads[key] = pending
+        pending.readers += 1
+        try:
+            return await asyncio.shield(pending.task)
+        finally:
+            pending.readers -= 1
+            if pending.readers == 0:
+                self._pending_page_reads.pop(key, None)
+                if not pending.task.done():
+                    pending.task.cancel()
+                    await asyncio.gather(pending.task, return_exceptions=True)
 
     #----- Build a prefetching, range-aware streaming generator for a file
     async def prefetch_stream(
@@ -231,10 +256,20 @@ class ByteStreamer:
                     _RECENT_CHUNKS[cache_key] = cached
                     return seq_idx, cached[1]
 
+            if cache_key is not None and part_count == 1 and len(session_pool) == 1:
+                # A probe can outlive the request that started it when another
+                # request for the same token, media page, and session joins.
+                key = (*cache_key, id(media_session))
+                return seq_idx, await self._share_page_read(
+                    key, lambda: download_chunk(seq_idx, off, cache_key, shared=True),
+                )
+            return seq_idx, await download_chunk(seq_idx, off, cache_key)
+
+        async def download_chunk(seq_idx: int, off: int, cache_key: tuple | None, shared: bool = False) -> bytes | None:
             tries = 0
             flood_tries = 0
             expected = min(chunk_size, file_id.file_size - off)
-            while tries < 3 and flood_tries < 5 and not stop_event.is_set():
+            while tries < 3 and flood_tries < 5 and (shared or not stop_event.is_set()):
                 c_idx, c_session, c_loc_box, c_streamer = session_pool[(seq_idx + tries) % len(session_pool)]
                 try:
                     location = c_loc_box[0]
@@ -259,7 +294,7 @@ class ByteStreamer:
                     if cache_key is not None and location.id == file_id.media_id:
                         _RECENT_CHUNKS[cache_key] = (time.monotonic() + _RECENT_CHUNK_TTL, chunk_bytes)
 
-                    return seq_idx, chunk_bytes
+                    return chunk_bytes
 
                 except asyncio.TimeoutError:
                     tries += 1
@@ -271,7 +306,7 @@ class ByteStreamer:
 
                     if "FILE_REFERENCE" in err_str or "file_reference" in err_str.lower():
                         if not await refresh_location(c_loc_box, c_streamer):
-                            return seq_idx, None
+                            return None
 
                     flood_m = re.search(r'wait of (\d+) second', err_str, re.IGNORECASE)
                     if flood_m:
@@ -284,7 +319,7 @@ class ByteStreamer:
                         tries += 1
                         backoff = min(0.5 * (2 ** (tries - 1)), 10.0)
                         await asyncio.sleep(backoff)
-            return seq_idx, None
+            return None
 
         async def producer():
             scheduled_tasks = deque()
