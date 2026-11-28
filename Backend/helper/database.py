@@ -2624,15 +2624,24 @@ class Database:
                 "logged_at":   datetime.now(timezone.utc),
             }
             await self.dbs["tracking"]["stream_analytics"].insert_one(record)
-            token = stats.get("meta", {}).get("token")
+            token = record["token"]
             if token:
-                upd = {"last_active": datetime.now(timezone.utc)}
-                if record.get("title"):
-                    upd["last_title"] = record["title"]
-                if record.get("user_name"):
-                    upd["name"] = record["user_name"]
+                end_ts = stats.get("end_ts") or record["logged_at"].timestamp()
+                activity = {
+                    "last_active": {"$max": ["$last_active", datetime.fromtimestamp(end_ts, timezone.utc)]},
+                    "streams": {"$add": [{"$ifNull": ["$streams", 0]}, 1]},
+                }
+                if title := record["title"]:
+                    # An older stream can reach analytics after a slow title lookup.
+                    last_title_end = {"$ifNull": ["$last_title_end_ts", 0]}
+                    activity["last_title"] = {
+                        "$cond": [{"$gte": [end_ts, last_title_end]}, {"$literal": title}, "$last_title"],
+                    }
+                    activity["last_title_end_ts"] = {"$max": [end_ts, last_title_end]}
+                if user_name := record["user_name"]:
+                    activity["name"] = {"$literal": user_name}
                 await self.dbs["tracking"]["user_activity"].update_one(
-                    {"_id": token}, {"$set": upd, "$inc": {"streams": 1}}, upsert=True
+                    {"_id": token}, [{"$set": activity}], upsert=True
                 )
         except Exception as e:
             LOGGER.warning(f"Stream analytics log failed: {e}")

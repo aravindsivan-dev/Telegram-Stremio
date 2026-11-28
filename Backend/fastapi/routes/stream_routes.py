@@ -162,6 +162,17 @@ async def _db_client(fetch):
     return index, streamer, await fetch(streamer)
 
 
+async def _lookup_title(stream_id_hash: str | None, fallback: str) -> str:
+    if not stream_id_hash:
+        return fallback
+    cached = _title_cache.get(stream_id_hash)
+    if cached and time.monotonic() < cached[1]:
+        return cached[0] or fallback
+    title = await db.get_title_by_stream_id(stream_id_hash)
+    _title_cache[stream_id_hash] = (title, time.monotonic() + _TITLE_CACHE_TTL)
+    return title or fallback
+
+
 #----- Enrich playback analytics without holding up the response body
 def _stream_title_task(stream_id_hash: str | None, meta: dict) -> asyncio.Task[None] | None:
     if not stream_id_hash:
@@ -174,10 +185,7 @@ def _stream_title_task(stream_id_hash: str | None, meta: dict) -> asyncio.Task[N
 
     async def enrich():
         try:
-            title = await db.get_title_by_stream_id(stream_id_hash)
-            _title_cache[stream_id_hash] = (title, time.monotonic() + _TITLE_CACHE_TTL)
-            if title:
-                meta["title"] = title
+            meta["title"] = await _lookup_title(stream_id_hash, meta["title"])
         except Exception as exc:
             LOGGER.warning("Stream title lookup failed (%s)", type(exc).__name__)
 
