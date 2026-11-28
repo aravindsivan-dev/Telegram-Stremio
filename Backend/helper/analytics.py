@@ -5,7 +5,7 @@ import httpx
 
 from Backend import db
 from Backend.helper.bounded import BoundedDict
-from Backend.helper.cf_live import stream_report_is_current
+from Backend.helper.cf_live import is_active_stream
 from Backend.helper.custom_dl import ACTIVE_STREAMS
 from Backend.logger import LOGGER
 
@@ -218,9 +218,7 @@ async def get_activity_overview(page: int = 1, per_page: int = 5) -> dict:
     for info in ACTIVE_STREAMS.values():
         meta = info.get("meta", {}) or {}
         tok = meta.get("token")
-        if tok not in valid_tokens or info.get("status") != "active" or not info.get("total_bytes"):
-            continue
-        if not stream_report_is_current(info, now_ts):
+        if tok not in valid_tokens or not info.get("total_bytes") or not is_active_stream(info, now_ts):
             continue
         rank = (info.get("last_ts") or 0, info.get("start_ts") or 0)
         if tok not in playing or rank > playing[tok][0]:

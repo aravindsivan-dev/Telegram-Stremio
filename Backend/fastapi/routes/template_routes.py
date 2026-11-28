@@ -11,13 +11,14 @@ from Backend.fastapi.security.credentials import get_current_user, is_authentica
 from Backend.fastapi.themes import get_all_themes, get_theme, theme_key
 from Backend.helper.analytics import client_ip_from, get_activity_overview
 from Backend.helper.bounded import BoundedDict
-from Backend.helper.custom_dl import ACTIVE_STREAMS, RECENT_STREAMS
+from Backend.helper.cf_live import is_active_stream
+from Backend.helper.custom_dl import ACTIVE_STREAMS
 from Backend.helper.metadata import resolve_cover_url
 from Backend.helper.pyro import get_readable_time
 from Backend.helper.settings_manager import SettingsManager
 from Backend.helper.stream_formatter import PRESETS
 import Backend.pyrofork.bot as botmod
-from Backend.pyrofork.bot import StreamBot, multi_clients, work_loads_summary
+from Backend.pyrofork.bot import StreamBot, multi_clients
 
 templates = Jinja2Templates(directory="Backend/fastapi/templates")
 templates.env.globals["cover_url"] = resolve_cover_url
@@ -98,51 +99,20 @@ async def dashboard_page(request: Request, _: bool = Depends(require_auth)):
         total_movies, total_tv_shows = db.content_totals(db_stats)
 
         now = time.time()
-        PRUNE_SECONDS = 3
-        for sid, info in list(ACTIVE_STREAMS.items()):
-            status = info.get("status")
-            last_ts = info.get("end_ts") or info.get("last_ts") or info.get("start_ts", now)
-            if status in ("cancelled", "error", "finished") and (now - last_ts > PRUNE_SECONDS):
-                info["duration"] = round(now - info.get("start_ts", now), 1)
-                info["stream_id"] = sid
-                try:
-                    RECENT_STREAMS.appendleft(info)
-                    ACTIVE_STREAMS.pop(sid)
-                except KeyError:
-                    pass
-
-        active_streams_data = [
-            {
-                "stream_id": stream_id,
-                "msg_id": info.get("msg_id"),
-                "chat_id": info.get("chat_id"),
-                "status": info.get("status", "active"),
-                "total_bytes": info.get("total_bytes", 0),
-                "avg_mbps": round(info.get("avg_mbps", 0.0), 2),
-                "instant_mbps": round(info.get("instant_mbps", 0.0), 2),
-                "peak_mbps": round(info.get("peak_mbps", 0.0), 2),
-                "client_index": info.get("client_index", 0),
-                "dc_id": info.get("dc_id", 0),
-                "duration": round(now - info.get("start_ts", now), 1),
-                "meta": info.get("meta", {})
-            }
-            for stream_id, info in ACTIVE_STREAMS.items()
-        ]
+        active_count = sum(is_active_stream(info, now) for info in ACTIVE_STREAMS.values())
 
         system_stats = {
             "server_status": "running",
             "uptime": get_readable_time(now - StartTime),
             "telegram_bot": f"@{StreamBot.username}" if StreamBot and StreamBot.username else "@StreamBot",
             "connected_bots": len(multi_clients),
-            "loads": work_loads_summary(),
             "version": __version__,
             "movies": total_movies,
             "tv_shows": total_tv_shows,
             "databases": db_stats,
             "total_databases": len(db_stats),
             "current_db_index": db.current_db_index,
-            "active_streams": active_streams_data,
-            "total_active_streams": len(active_streams_data)
+            "total_active_streams": active_count,
         }
 
     except Exception as e:
@@ -153,14 +123,12 @@ async def dashboard_page(request: Request, _: bool = Depends(require_auth)):
             "uptime": "N/A",
             "telegram_bot": "@StreamBot",
             "connected_bots": 0,
-            "loads": {},
             "version": __version__,
             "movies": 0,
             "tv_shows": 0,
             "databases": [],
             "total_databases": 0,
             "current_db_index": 1,
-            "active_streams": [],
             "total_active_streams": 0
         }
 

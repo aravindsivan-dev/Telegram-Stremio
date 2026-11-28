@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 with patch.dict(os.environ, {
     "DATABASE": "mongodb://127.0.0.1:1/tracking,mongodb://127.0.0.1:1/storage",
@@ -17,7 +17,7 @@ with patch.dict(os.environ, {
     "BOT_TOKEN": "1234:test-owner",
 }):
     from Backend import db
-    from Backend.fastapi.routes import cf_routes, stream_routes
+    from Backend.fastapi.routes import cf_routes, stream_routes, template_routes
     from Backend.helper import analytics, cf_live
     from Backend.helper.cf_stream import _hmac
 
@@ -82,6 +82,9 @@ class DashboardPlaybackRouteTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((await report(cloudflare, signed=False)).status_code, 401)
                 self.assertEqual((await viewer())["playback_source"], "direct")
 
+                self.assertEqual((await report([{**cloudflare[0], "bytes": 0}])).status_code, 200)
+                self.assertEqual((await viewer())["playback_source"], "direct")
+
                 self.assertEqual((await report(cloudflare)).json(), {"ok": True})
                 row = await viewer()
                 self.assertTrue(row["proxy"])
@@ -99,7 +102,7 @@ class DashboardPlaybackRouteTests(unittest.IsolatedAsyncioTestCase):
                 active["cf-clip"]["reported_at"] = now - 61
                 self.assertIsNone((await viewer())["playback_source"])
                 self.assertIsNone((await viewer())["now_playing"])
-                self.assertEqual([s["source"] for s in (await stats())["active_streams"]], ["direct"])
+                self.assertEqual((await stats())["active_streams"], [])
 
                 self.assertEqual((await report(cloudflare)).status_code, 200)
                 self.assertEqual((await viewer())["playback_source"], "cloudflare")
@@ -107,3 +110,28 @@ class DashboardPlaybackRouteTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
                 self.assertIsNone((await viewer())["playback_source"])
                 self.assertEqual((await stats())["recent_streams"][0]["source"], "cloudflare")
+
+    async def test_initial_dashboard_and_polled_stats_exclude_stale_and_finished_streams(self):
+        now = time.time()
+        active = {
+            "cf-live": {"status": "active", "reported_at": now, "meta": {"source": "cloudflare"}},
+            "cf-stale": {"status": "active", "reported_at": now - 61, "meta": {"source": "cloudflare"}},
+            "direct-live": {"status": "active", "meta": {"source": "direct"}},
+            "direct-ended": {"status": "finished", "end_ts": now - 5, "meta": {"source": "direct"}},
+        }
+
+        with (
+            patch.object(template_routes, "ACTIVE_STREAMS", active),
+            patch.object(template_routes, "StreamBot", SimpleNamespace(username="TestBot")),
+            patch.object(stream_routes, "ACTIVE_STREAMS", active),
+            patch.object(db, "get_database_stats", new=AsyncMock(return_value=[])),
+            patch.object(template_routes, "get_activity_overview", new=AsyncMock(return_value={"users": []})),
+        ):
+            request = Request({"type": "http", "path": "/", "headers": [], "session": {}})
+            page = await template_routes.dashboard_page(request)
+            self.assertEqual(page.status_code, 200)
+            self.assertIn(b'id="sys-live-streams">2</span>', page.body)
+            self.assertIn(b'id="live-stream-count" class="text-sm text-text-secondary">2 active</span>', page.body)
+            stats = json.loads((await stream_routes.get_stream_stats()).body)
+            self.assertEqual([s["stream_id"] for s in stats["active_streams"]], ["cf-live", "direct-live"])
+            self.assertIn("direct-ended", active)
