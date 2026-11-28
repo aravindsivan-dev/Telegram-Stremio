@@ -7,6 +7,15 @@ from Backend.helper.custom_dl import ACTIVE_STREAMS, RECENT_STREAMS
 from Backend.pyrofork.bot import client_avg_mbps, work_loads
 
 MIB = 1024 * 1024
+_REPORT_FRESHNESS_SECONDS = 60
+
+
+def stream_report_is_current(entry: dict, now: float) -> bool:
+    """Allow several missed 15-second Worker reports before hiding a stale stream."""
+    return (
+        entry.get("meta", {}).get("source") != "cloudflare"
+        or now - entry.get("reported_at", 0) <= _REPORT_FRESHNESS_SECONDS
+    )
 
 
 #----- Show Cloudflare streams like local ones. Each Worker client reports its live streams every
@@ -61,6 +70,7 @@ async def apply_report(member: str, client_index, dc, streams: list) -> None:
             entry["peak_mbps"] = max(entry["peak_mbps"], entry["instant_mbps"])
         entry["total_bytes"] = total
         entry["last_ts"] = last_ts
+        entry["reported_at"] = now
         duration = last_ts - entry["start_ts"]
         entry["avg_mbps"] = total / MIB / duration if duration > 0 else 0.0
 
