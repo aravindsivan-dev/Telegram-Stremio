@@ -17,6 +17,7 @@ from pyrogram.session import Auth, Session
 from Backend import db
 from Backend.helper.exceptions import FileNotFound
 from Backend.helper.pyro import get_file_ids
+from Backend.helper.stream_container import split_video_content_type
 from Backend.logger import LOGGER
 from Backend.helper.bounded import BoundedDict
 from Backend.pyrofork.bot import client_avg_mbps, client_dc_map, client_failures, multi_clients, work_loads
@@ -29,6 +30,9 @@ _STALE_CLEANER_STARTED = False
 # Keep at most 64 MiB of recently fetched Direct chunks per process.
 _RECENT_CHUNKS = BoundedDict(64)
 _RECENT_CHUNK_TTL = 45
+_SPLIT_TYPES = BoundedDict(128)
+_CONTAINER_PROBE_BYTES = 4096
+_CONTAINER_PROBE_TIMEOUT = 1.0
 
 
 @dataclass
@@ -161,6 +165,30 @@ class ByteStreamer:
                 if not pending.task.done():
                     pending.task.cancel()
                     await asyncio.gather(pending.task, return_exceptions=True)
+
+    async def get_split_video_type(self, file_id: FileId) -> str | None:
+        key = _media_identity(file_id)
+        if key in _SPLIT_TYPES:
+            return _SPLIT_TYPES[key]
+
+        async def read_header() -> bytes | None:
+            try:
+                session = await self._get_media_session(file_id)
+                location = await self._get_location(file_id)
+                response = await asyncio.wait_for(session.send(raw.functions.upload.GetFile(
+                    location=location, offset=0, limit=_CONTAINER_PROBE_BYTES,
+                )), timeout=_CONTAINER_PROBE_TIMEOUT)
+            except Exception:
+                # Stream normally if Telegram cannot answer the optional probe.
+                return None
+            prefix = getattr(response, "bytes", None)
+            if isinstance(prefix, bytes) and prefix and len(prefix) == min(_CONTAINER_PROBE_BYTES, file_id.file_size):
+                _SPLIT_TYPES[key] = split_video_content_type(prefix)
+                return prefix
+            return None
+
+        await self._share_page_read(("split-type", *key), read_header)
+        return _SPLIT_TYPES.get(key)
 
     #----- Build a prefetching, range-aware streaming generator for a file
     async def prefetch_stream(

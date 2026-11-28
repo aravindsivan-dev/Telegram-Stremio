@@ -21,6 +21,82 @@ with patch.dict(os.environ, {
     from Backend.fastapi.main import auth_exception_handler
     from Backend.fastapi.routes import stream_routes
     from Backend.helper import cf_live, custom_dl, virtual_dl
+    from Backend.helper.stream_container import split_video_content_type
+
+
+class SplitVideoTypeTests(unittest.IsolatedAsyncioTestCase):
+    def test_ebml_doc_type_must_be_a_complete_header_element(self):
+        matroska = bytes.fromhex("1a45dfa38b428288") + b"matroska"
+        webm = bytes.fromhex("1a45dfa34007428284") + b"webm"
+        self.assertEqual(split_video_content_type(matroska), "video/x-matroska")
+        self.assertEqual(split_video_content_type(webm), "video/webm")
+        self.assertIsNone(split_video_content_type(matroska[:-1]))
+        self.assertIsNone(split_video_content_type(b"PK\x03\x04" + matroska))
+        self.assertIsNone(split_video_content_type(bytes.fromhex("1a45dfa38dec8b") + matroska[5:]))
+
+    async def test_split_head_and_seek_return_matroska_with_only_one_probe(self):
+        header = bytes.fromhex("1a45dfa38b428288") + b"matroska"
+        first = header + b"A" * (8192 - len(header))
+        second = b"B" * 8192
+        data = {1: first, 2: second}
+        calls = []
+
+        async def send(query):
+            calls.append((query.location.id, query.offset, query.limit))
+            return SimpleNamespace(bytes=data[query.location.id][query.offset:query.offset + query.limit])
+
+        reader = object.__new__(custom_dl.ByteStreamer)
+        reader._pending_page_reads = {}
+        reader._get_media_session = AsyncMock(return_value=SimpleNamespace(send=send))
+        reader._get_location = AsyncMock(side_effect=lambda file_id: SimpleNamespace(id=file_id.media_id))
+        parts = [
+            {"index": i - 1, "chat_id": 123, "msg_id": i, "size": len(item), "cum_start": (i - 1) * 8192,
+             "file_id": SimpleNamespace(dc_id=1, media_id=i, file_size=len(item), file_name="clip.zip.001",
+                                        mime_type="application/zip")}
+            for i, item in data.items()
+        ]
+        with (
+            patch.object(stream_routes, "_db_client", new=AsyncMock(return_value=(0, reader, (parts, 16384)))),
+            patch.object(stream_routes, "_prefetch_for", return_value=(1, 1)),
+            patch.object(stream_routes, "track_usage", new_callable=AsyncMock),
+            patch.object(custom_dl, "_SPLIT_TYPES", {}),
+            patch.object(custom_dl, "_RECENT_CHUNKS", {}),
+            patch.object(custom_dl, "ACTIVE_STREAMS", {}),
+            patch.object(custom_dl, "work_loads", {0: 0}),
+            patch.object(custom_dl, "client_avg_mbps", {0: 0}),
+            patch.object(db, "log_stream_stats", new_callable=AsyncMock),
+        ):
+            head = await stream_routes.virtual_media_streamer(Request({"type": "http", "method": "HEAD", "headers": []}), [], "viewer")
+            self.assertEqual(head.headers["content-type"], "video/x-matroska")
+            self.assertEqual(head.headers["content-length"], "16384")
+            self.assertEqual(head.body, b"")
+            self.assertEqual(calls, [(1, 0, 4096)])
+
+            request = Request({"type": "http", "method": "GET", "headers": [(b"range", b"bytes=8190-8193")]})
+            response = await stream_routes.virtual_media_streamer(request, [], "viewer")
+            self.assertEqual(response.status_code, 206)
+            self.assertEqual(response.headers["content-type"], "video/x-matroska")
+            self.assertEqual(response.headers["content-range"], "bytes 8190-8193/16384")
+            self.assertEqual(b"".join([chunk async for chunk in response.body_iterator]), b"AABB")
+            await asyncio.sleep(0)
+        self.assertEqual(calls, [(1, 0, 4096), (1, 0, 1048576), (2, 0, 1048576)])
+
+    async def test_failed_probe_is_retryable_and_genuine_zip_keeps_its_mime(self):
+        send = AsyncMock(side_effect=[
+            TimeoutError(),
+            SimpleNamespace(bytes=b"PK\x03\x04" + b"\0" * 4092),
+        ])
+        reader = object.__new__(custom_dl.ByteStreamer)
+        reader._pending_page_reads = {}
+        reader._get_media_session = AsyncMock(return_value=SimpleNamespace(send=send))
+        reader._get_location = AsyncMock(return_value=SimpleNamespace(id=1))
+        file_id = SimpleNamespace(dc_id=1, media_id=1, file_size=8192, file_name="archive.zip.001",
+                                  mime_type="application/zip")
+        with patch.object(custom_dl, "_SPLIT_TYPES", {}):
+            for _ in range(3):
+                self.assertEqual(await stream_routes._resolve_split_filename_mime(reader, file_id),
+                                 ("archive.zip.001", "application/zip"))
+            self.assertEqual(send.await_count, 2)
 
 
 class StreamIntegrityTests(unittest.IsolatedAsyncioTestCase):
@@ -286,6 +362,7 @@ class StreamDashboardTests(unittest.TestCase):
         stream = {
             "stream_id": "example", "start_ts": time.time() - 20, "status": "active",
             "total_bytes": 100, "last_bytes": 100, "last_activity_ts": time.time() - 20,
+            "last_ts": 123.5,
             "meta": {"title": "Example", "token": "test-token", "client_host": "192.0.2.10"},
         }
         with (
@@ -300,6 +377,7 @@ class StreamDashboardTests(unittest.TestCase):
             summary = client.get("/stream/stats")
             self.assertEqual(summary.status_code, 200)
             self.assertEqual(summary.json()["active_streams"][0]["status"], "active")
+            self.assertEqual(summary.json()["active_streams"][0]["speed_sampled_at"], 123.5)
             self.assertEqual(stream["status"], "active")
             detail = client.get("/stream/stats/example")
             self.assertEqual(detail.status_code, 200)

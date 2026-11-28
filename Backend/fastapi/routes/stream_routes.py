@@ -201,6 +201,13 @@ def _resolve_filename_mime(file_id):
     return file_name, mime_type
 
 
+async def _resolve_split_filename_mime(streamer: ByteStreamer, file_id):
+    file_name, mime_type = _resolve_filename_mime(file_id)
+    if mime_type in {"application/zip", "application/x-zip-compressed", "application/octet-stream"}:
+        mime_type = await streamer.get_split_video_type(file_id) or mime_type
+    return file_name, mime_type
+
+
 def _content_disposition(file_name, disposition="inline"):
     ascii_fallback = file_name.encode("ascii", "ignore").decode("ascii").replace('"', "").strip() or "file"
     return f"{disposition}; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(file_name, safe='')}"
@@ -450,7 +457,7 @@ async def virtual_media_streamer(request: Request, parts_payload: list, token: s
     start, end = parse_range_header(range_header, file_size)
     req_length = end - start + 1
     chunk_size = 1024 * 1024
-    file_name, mime_type = _resolve_filename_mime(parts[0]["file_id"])
+    file_name, mime_type = await _resolve_split_filename_mime(streamer, parts[0]["file_id"])
     common_headers, status = _build_stream_headers(mime_type, file_name, req_length, range_header, start, end, file_size)
     if request.method == "HEAD":
         return PlainResponse(status_code=status, headers=common_headers)
@@ -562,7 +569,7 @@ async def global_virtual_media_streamer(request: Request, parts_payload: list, t
     range_header = request.headers.get("Range", "")
     start, end = parse_range_header(range_header, file_size)
     req_length = end - start + 1
-    file_name, mime_type = _resolve_filename_mime(parts[0]["file_id"])
+    file_name, mime_type = await _resolve_split_filename_mime(streamer, parts[0]["file_id"])
     headers, status = _build_stream_headers(mime_type, file_name, req_length, range_header, start, end, file_size)
     if request.method == "HEAD":
         return PlainResponse(status_code=status, headers=headers)
@@ -717,6 +724,7 @@ async def get_stream_stats():
             "avg_mbps": round(info.get("avg_mbps", 0.0), 3),
             "peak_mbps": round(info.get("peak_mbps", 0.0), 3),
             "start_ts": info.get("start_ts"),
+            "speed_sampled_at": (info.get("end_ts") or info.get("last_ts")) if info.get("total_bytes") else None,
         }
         for sid, info in ACTIVE_STREAMS.items()
     ]
