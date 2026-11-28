@@ -280,7 +280,9 @@
 
     function getClientLabel(stream) {
         const parts = [];
-        if (stream?.client_index !== null && stream?.client_index !== undefined) {
+        if (stream?.client_index === -1) {
+            parts.push('Userbot');
+        } else if (stream?.client_index !== null && stream?.client_index !== undefined) {
             parts.push('Bot ' + (Number(stream.client_index) + 1));
         }
         if (stream?.dc_id !== null && stream?.dc_id !== undefined) {
@@ -422,26 +424,26 @@
         const icon = document.getElementById('refresh-icon');
         if (icon) icon.classList.add('fa-spin');
 
+        const liveStats = loadStreamStats();
         try {
             const response = await fetch('/api/system/stats', { cache: 'no-store' });
-            if (response.ok) {
-                const stats = await response.json();
+            if (!response.ok) throw new Error('Failed to load server summary');
+            const stats = await response.json();
+            if (stats.server_status === 'error') throw new Error('Failed to load server summary');
 
-                const elUptime = document.getElementById('sys-uptime');
-                if (elUptime) elUptime.innerText = stats.uptime || 'N/A';
+            const elUptime = document.getElementById('sys-uptime');
+            if (elUptime) elUptime.innerText = stats.uptime || 'N/A';
 
-                const elBotCount = document.getElementById('sys-bots-count');
-                if (elBotCount) elBotCount.innerText = stats.connected_bots ?? 0;
+            const elBotCount = document.getElementById('sys-bots-count');
+            if (elBotCount) elBotCount.innerText = stats.connected_bots ?? 0;
 
-                const elVersion = document.getElementById('sys-version');
-                if (elVersion) elVersion.innerText = 'v' + (stats.version || '1.0.0');
-            }
-
-            await loadStreamStats();
+            const elVersion = document.getElementById('sys-version');
+            if (elVersion) elVersion.innerText = 'v' + (stats.version || '1.0.0');
         } catch (error) {
-            console.error('Failed to refresh dashboard:', error);
-            showToast('Dashboard refresh failed.', 'error', 'Refresh failed');
+            console.error('Failed to refresh server summary:', error);
+            showToast('Unable to load the server summary.', 'error', 'Refresh failed');
         } finally {
+            await liveStats;
             setTimeout(() => { if (icon) icon.classList.remove('fa-spin'); }, 450);
         }
     }
