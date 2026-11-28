@@ -210,6 +210,7 @@ class ByteStreamer:
         extra_clients: Optional[List] = None,
         rewind_scope: Optional[str] = None,
         title_task: Optional[asyncio.Task[None]] = None,
+        report_playback: bool = True,
     ):
         if not stream_id:
             stream_id = secrets.token_hex(8)
@@ -405,7 +406,8 @@ class ByteStreamer:
 
         async def consumer_generator():
             stream_entry["last_ts"] = time.time()
-            ACTIVE_STREAMS[stream_id] = stream_entry
+            if report_playback:
+                ACTIVE_STREAMS[stream_id] = stream_entry
             work_loads[client_index] += 1
             producer_task = asyncio.create_task(producer())
             current_part_idx = 1
@@ -502,38 +504,39 @@ class ByteStreamer:
                         pass
 
                 try:
-                    end_ts = time.time()
-                    total_bytes = stream_entry.get("total_bytes", 0)
-                    start_ts = stream_entry.get("start_ts") or end_ts
-                    duration = end_ts - start_ts if end_ts > start_ts else 0.0
-                    avg_mbps = (total_bytes / (1024 * 1024)) / (duration if duration > 0 else 1e-6)
+                    if report_playback:
+                        end_ts = time.time()
+                        total_bytes = stream_entry.get("total_bytes", 0)
+                        start_ts = stream_entry.get("start_ts") or end_ts
+                        duration = end_ts - start_ts if end_ts > start_ts else 0.0
+                        avg_mbps = (total_bytes / (1024 * 1024)) / (duration if duration > 0 else 1e-6)
 
-                    stream_entry.update({
-                        "end_ts": end_ts,
-                        "duration": duration,
-                        "avg_mbps": avg_mbps,
-                        "status": "finished" if stream_entry.get("status") == "active" else stream_entry.get("status", "finished"),
-                        "parallelism": parallelism,
-                        "chunk_size": chunk_size,
-                    })
+                        stream_entry.update({
+                            "end_ts": end_ts,
+                            "duration": duration,
+                            "avg_mbps": avg_mbps,
+                            "status": "finished" if stream_entry.get("status") == "active" else stream_entry.get("status", "finished"),
+                            "parallelism": parallelism,
+                            "chunk_size": chunk_size,
+                        })
 
-                    prev = client_avg_mbps.get(client_index, 0.0)
-                    if prev == 0.0:
-                        client_avg_mbps[client_index] = avg_mbps
-                    else:
-                        client_avg_mbps[client_index] = 0.5 * prev + 0.5 * avg_mbps
+                        prev = client_avg_mbps.get(client_index, 0.0)
+                        if prev == 0.0:
+                            client_avg_mbps[client_index] = avg_mbps
+                        else:
+                            client_avg_mbps[client_index] = 0.5 * prev + 0.5 * avg_mbps
 
-                    asyncio.create_task(_persist_stream_stats(stream_entry, title_task))
+                        asyncio.create_task(_persist_stream_stats(stream_entry, title_task))
 
-                    async def delayed_pop():
-                        await asyncio.sleep(3)
-                        try:
-                            if stream_id in ACTIVE_STREAMS:
-                                RECENT_STREAMS.appendleft(ACTIVE_STREAMS.pop(stream_id))
-                        except Exception:
-                            pass
+                        async def delayed_pop():
+                            await asyncio.sleep(3)
+                            try:
+                                if stream_id in ACTIVE_STREAMS:
+                                    RECENT_STREAMS.appendleft(ACTIVE_STREAMS.pop(stream_id))
+                            except Exception:
+                                pass
 
-                    asyncio.create_task(delayed_pop())
+                        asyncio.create_task(delayed_pop())
                 finally:
                     if stream_entry.pop("load_held", False):
                         work_loads[client_index] = max(0, work_loads.get(client_index, 0) - 1)

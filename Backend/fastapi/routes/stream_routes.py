@@ -598,24 +598,6 @@ async def global_virtual_media_streamer(request: Request, parts_payload: list, t
 
 
 #----- Read a byte range from the concatenated virtual parts into memory
-async def _read_virtual_range(parts, start, length, streamer, request, client_index=USERBOT_CLIENT_INDEX, parallelism=1, prefetch_count=1):
-    buf = bytearray()
-    gen = virtual_stream_generator(
-        parts=parts, start=start, end=start + length - 1, chunk_size=1024 * 1024,
-        streamer=streamer, client_index=client_index, request=request,
-        meta={"title": "zip-index", "user_name": "system", "token": ""},
-        stream_id=secrets.token_hex(6), parallelism=parallelism, prefetch_count=prefetch_count,
-    )
-    try:
-        async for chunk in gen:
-            buf.extend(chunk)
-            if len(buf) >= length:
-                break
-    finally:
-        await gen.aclose()
-    return bytes(buf[:length])
-
-
 #----- Stream a split ZIP archive (.zip.001/.002 ...) as its inner video, with seeking.
 #----- Only STORED (uncompressed) archives are seekable; the inner file bytes are served
 #----- directly at their offset inside the concatenated zip (no stream-unzip needed).
@@ -628,7 +610,22 @@ async def _zip_media_streamer(request, parts_payload, token, token_data, stream_
         raise HTTPException(status_code=404, detail="Split archive parts not accessible")
 
     async def _read(off, length):
-        return await _read_virtual_range(parts, off, length, streamer, request, client_index, parallelism, prefetch_count)
+        # Share archive inspection chunks with playback for the same token and media.
+        gen = virtual_stream_generator(
+            parts=parts, start=off, end=off + length - 1, chunk_size=1024 * 1024,
+            streamer=streamer, client_index=client_index, request=request,
+            meta=None, stream_id=secrets.token_hex(6), parallelism=parallelism, prefetch_count=prefetch_count,
+            rewind_scope=rewind_scope, report_playback=False,
+        )
+        buf = bytearray()
+        try:
+            async for chunk in gen:
+                buf.extend(chunk)
+                if len(buf) >= length:
+                    break
+        finally:
+            await gen.aclose()
+        return bytes(buf[:length])
 
     cache_key = None
     entry = None

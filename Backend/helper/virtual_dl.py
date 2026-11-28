@@ -77,6 +77,7 @@ async def virtual_stream_generator(
     prefetch_count: int,
     rewind_scope: Optional[str] = None,
     title_task: Optional[asyncio.Task[None]] = None,
+    report_playback: bool = True,
 ):
     pos = start
     for part in parts:
@@ -112,6 +113,7 @@ async def virtual_stream_generator(
             message_id=part["msg_id"],
             rewind_scope=rewind_scope,
             title_task=title_task,
+            report_playback=report_playback,
         )
 
         remaining = local_end - local_start + 1

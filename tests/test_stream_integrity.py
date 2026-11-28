@@ -1,7 +1,9 @@
 import asyncio
+import io
 import os
 import time
 import unittest
+import zipfile
 from collections import deque
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -100,6 +102,70 @@ class SplitVideoTypeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StreamIntegrityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_split_zip_reuses_header_chunk_and_logs_only_playback(self):
+        clip = b"A" * 80 + b"B" * 80
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as writer:
+            writer.writestr("clip.mkv", clip)
+        data = {1: archive.getvalue()[:100], 2: archive.getvalue()[100:]}
+        file_ids = {
+            i: SimpleNamespace(dc_id=1, media_id=i, file_size=len(part))
+            for i, part in data.items()
+        }
+        reader = object.__new__(custom_dl.ByteStreamer)
+        reader._pending_page_reads = {}
+        reader.get_file_properties = AsyncMock(side_effect=lambda chat_id, message_id: file_ids[message_id])
+        calls = []
+
+        async def send(query):
+            calls.append(query.location.id)
+            return SimpleNamespace(bytes=data[query.location.id][query.offset:query.offset + query.limit])
+
+        reader._get_media_session = AsyncMock(return_value=SimpleNamespace(send=send))
+        reader._get_location = AsyncMock(side_effect=lambda file_id: SimpleNamespace(id=file_id.media_id))
+
+        async def db_client(fetch):
+            return 0, reader, await fetch(reader)
+
+        def request(method, byte_range):
+            return Request({"type": "http", "method": method, "headers": [(b"range", byte_range)]})
+
+        parts = [{"chat_id": 123, "msg_id": i} for i in data]
+        active, loads = {}, {0: 0}
+        with (
+            patch.object(stream_routes, "_db_client", side_effect=db_client),
+            patch.object(stream_routes, "_prefetch_for", return_value=(1, 1)),
+            patch.object(stream_routes, "_zip_entry_cache", {}),
+            patch.object(stream_routes, "track_usage", new_callable=AsyncMock) as track_usage,
+            patch.object(custom_dl, "ACTIVE_STREAMS", active),
+            patch.object(custom_dl, "_RECENT_CHUNKS", {}),
+            patch.object(custom_dl, "work_loads", loads),
+            patch.object(custom_dl, "client_avg_mbps", {}),
+            patch.object(db, "log_stream_stats", new_callable=AsyncMock) as history,
+        ):
+            head = await stream_routes.db_zip_media_streamer(request("HEAD", b"bytes=0-31"), parts, "viewer")
+            self.assertEqual(head.status_code, 206)
+            self.assertEqual(head.headers["Content-Range"], "bytes 0-31/160")
+            self.assertEqual(head.body, b"")
+            self.assertFalse(active)
+            self.assertEqual(loads[0], 0)
+            history.assert_not_called()
+            track_usage.assert_not_called()
+            calls.clear()
+
+            response = await stream_routes.db_zip_media_streamer(request("GET", b"bytes=60-83"), parts, "viewer")
+            self.assertEqual(response.headers["Content-Range"], "bytes 60-83/160")
+            self.assertEqual(b"".join([chunk async for chunk in response.body_iterator]), clip[60:84])
+            self.assertEqual(calls, [])
+
+            response = await stream_routes.db_zip_media_streamer(request("GET", b"bytes=0-31"), parts, "other")
+            self.assertEqual(b"".join([chunk async for chunk in response.body_iterator]), clip[:32])
+            self.assertEqual(calls, [1, 2])
+            await asyncio.sleep(0)
+            self.assertEqual(loads[0], 0)
+            self.assertEqual(track_usage.await_count, 2)
+            self.assertEqual([c.args[0]["meta"]["title"] for c in history.await_args_list], ["clip.mkv"] * 3)
+
     async def test_split_resolves_two_parts_at_a_time_and_preserves_offsets(self):
         started = []
         completed = []
